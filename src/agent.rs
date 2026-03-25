@@ -75,9 +75,9 @@ pub async fn send(name: &str, message: &str, max_turns: Option<u32>) -> Result<S
 
     let turns = max_turns.unwrap_or(state.config.max_turns);
 
+    // All flags must come before -p <message> to avoid messages starting with '-'
+    // being parsed as flags.
     let mut args = vec![
-        "-p".to_string(),
-        message.to_string(),
         "--output-format".to_string(),
         "stream-json".to_string(),
         "--verbose".to_string(),
@@ -97,6 +97,10 @@ pub async fn send(name: &str, message: &str, max_turns: Option<u32>) -> Result<S
         args.push("--system-prompt".to_string());
         args.push(state.config.system_prompt.clone());
     }
+
+    // -p <message> must be last to avoid messages starting with '-' being parsed as flags
+    args.push("-p".to_string());
+    args.push(message.to_string());
 
     let output = Command::new("claude")
         .args(&args)
