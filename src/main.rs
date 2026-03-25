@@ -115,7 +115,8 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 // If bus socket exists, route through bus; otherwise direct
                 if std::path::Path::new(&socket).exists() {
-                    let target = format!("agent:{}", name);
+                    // If name contains ':', treat as raw target (e.g. telegram:-123)
+                    let target = if name.contains(':') { name.clone() } else { format!("agent:{}", name) };
                     worker::send_via_bus(&socket, "cli", &target, &message, max_turns).await?;
                 } else {
                     let response = agent::send(&name, &message, max_turns).await?;
