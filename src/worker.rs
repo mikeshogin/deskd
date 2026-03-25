@@ -193,8 +193,12 @@ pub async fn send_via_bus(socket_path: &str, source: &str, target: &str, task: &
 
 fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max {
-        s
-    } else {
-        &s[..max]
+        return s;
     }
+    // Find the last char boundary at or before max
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
