@@ -14,7 +14,7 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -77,38 +77,37 @@ pub async fn run(agent_name: &str) -> Result<()> {
     let mut stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin);
 
+    // Detect framing mode from first line of input.
+    // Claude Code uses newline-delimited JSON (no Content-Length headers).
+    // Older MCP clients use Content-Length framed messages.
+    let mut lines = reader.lines();
+
     loop {
-        // Read Content-Length header
-        let content_length = match read_content_length(&mut reader).await {
-            Ok(Some(n)) => n,
+        let line = match lines.next_line().await {
+            Ok(Some(l)) => l,
             Ok(None) => break, // stdin closed
             Err(e) => {
-                warn!(error = %e, "failed to read Content-Length header");
-                continue;
+                warn!(error = %e, "failed to read line");
+                break;
             }
         };
 
-        // Read exactly content_length bytes of JSON
-        let mut buf = vec![0u8; content_length];
-        if let Err(e) = reader.read_exact(&mut buf).await {
-            warn!(error = %e, "failed to read message body");
-            break;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
         }
 
-        let json_str = match std::str::from_utf8(&buf) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(error = %e, "invalid UTF-8 in message");
-                continue;
-            }
-        };
+        // Skip Content-Length headers (compat with framed clients).
+        if trimmed.starts_with("Content-Length:") {
+            continue;
+        }
 
-        debug!(msg = %json_str, "received MCP message");
+        debug!(msg = %trimmed, "received MCP message");
 
-        let req: Request = match serde_json::from_str(json_str) {
+        let req: Request = match serde_json::from_str(trimmed) {
             Ok(r) => r,
             Err(e) => {
-                warn!(error = %e, "failed to parse JSON-RPC request");
+                warn!(error = %e, line = %trimmed, "failed to parse JSON-RPC request");
                 let resp = Response::err(None, -32700, "Parse error");
                 write_response(&mut stdout, &resp).await?;
                 continue;
@@ -386,39 +385,11 @@ async fn call_add_persistent_agent(
 
 // ─── I/O helpers ──────────────────────────────────────────────────────────────
 
-/// Read "Content-Length: N\r\n\r\n" header. Returns None on EOF.
-async fn read_content_length<R: AsyncBufReadExt + Unpin>(
-    reader: &mut R,
-) -> Result<Option<usize>> {
-    let mut header = String::new();
-    loop {
-        let n = reader.read_line(&mut header).await?;
-        if n == 0 {
-            return Ok(None); // EOF
-        }
-        let trimmed = header.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            // Blank line — end of headers, but we haven't seen Content-Length yet.
-            // Reset and keep reading.
-            header.clear();
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_prefix("Content-Length:") {
-            let len: usize = rest.trim().parse().context("invalid Content-Length")?;
-            // Consume the blank line separator
-            let mut blank = String::new();
-            reader.read_line(&mut blank).await?;
-            return Ok(Some(len));
-        }
-        // Ignore other headers (e.g. Content-Type)
-        header.clear();
-    }
-}
-
 async fn write_response<W: AsyncWriteExt + Unpin>(writer: &mut W, resp: &Response) -> Result<()> {
     let json = serde_json::to_string(resp)?;
-    let framed = format!("Content-Length: {}\r\n\r\n{}", json.len(), json);
-    writer.write_all(framed.as_bytes()).await?;
+    // Newline-delimited JSON (compatible with Claude Code).
+    writer.write_all(json.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
     writer.flush().await?;
     debug!(resp = %json, "sent MCP response");
     Ok(())

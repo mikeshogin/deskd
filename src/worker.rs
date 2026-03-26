@@ -5,6 +5,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::agent;
+use crate::inbox;
 use crate::message::{Message, Metadata};
 
 /// Connect to the bus, register, and return the stream.
@@ -28,6 +29,23 @@ pub async fn bus_connect(
 
     info!(agent = %name, "registered on bus");
     Ok(stream)
+}
+
+/// Helper: write an inbox entry for a completed task.
+fn write_inbox(name: &str, msg: &Message, task: &str, result: Option<String>, error: Option<String>) {
+    let entry = inbox::InboxEntry {
+        id: msg.id.clone(),
+        agent: name.to_string(),
+        source: msg.source.clone(),
+        task: task.to_string(),
+        result,
+        error,
+        in_reply_to: msg.id.clone(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    };
+    if let Err(e) = inbox::write(name, &entry) {
+        warn!(agent = %name, error = %e, "failed to write inbox entry");
+    }
 }
 
 /// Run the agent worker loop: read messages from bus, execute tasks, post results.
@@ -130,6 +148,7 @@ pub async fn run(name: &str, socket_path: &str, bus_socket: Option<String>) -> R
 
             if let Err(e) = result {
                 warn!(agent = %name, error = %e, "task failed");
+                write_inbox(name, &msg, task, None, Some(format!("{}", e)));
                 write_bus_envelope(
                     &writer,
                     name,
@@ -144,6 +163,9 @@ pub async fn run(name: &str, socket_path: &str, bus_socket: Option<String>) -> R
             match agent::send(name, task, max_turns, bus_socket.as_deref()).await {
                 Ok(response) => {
                     info!(agent = %name, "task completed, posting result");
+
+                    // Write to file-based inbox for async reading.
+                    write_inbox(name, &msg, task, Some(response.clone()), None);
 
                     let target = msg.reply_to.as_deref().unwrap_or(&msg.source);
 
@@ -179,6 +201,9 @@ pub async fn run(name: &str, socket_path: &str, bus_socket: Option<String>) -> R
                 }
                 Err(e) => {
                     warn!(agent = %name, error = %e, "task failed");
+
+                    // Write error to inbox.
+                    write_inbox(name, &msg, task, None, Some(format!("{}", e)));
 
                     if let Some(reply_to) = &msg.reply_to {
                         let error_msg = serde_json::json!({

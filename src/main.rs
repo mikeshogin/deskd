@@ -2,6 +2,7 @@ mod adapters;
 mod agent;
 mod bus;
 mod config;
+mod inbox;
 mod mcp;
 mod message;
 mod schedule;
@@ -85,6 +86,13 @@ enum AgentAction {
     /// Show detailed stats for an agent.
     Stats {
         name: String,
+    },
+    /// Read buffered task results from an agent's inbox.
+    Read {
+        name: String,
+        /// Remove messages after reading.
+        #[arg(long, default_value = "false")]
+        clear: bool,
     },
     /// Remove an agent (state file + log).
     Rm {
@@ -211,6 +219,29 @@ async fn main() -> anyhow::Result<()> {
                 );
                 println!("Created:    {}", s.created_at);
             }
+            AgentAction::Read { name, clear } => {
+                let entries = inbox::read(&name)?;
+                if entries.is_empty() {
+                    println!("No messages for {}", name);
+                } else {
+                    let paths: Vec<_> = entries.iter().map(|(p, _)| p.clone()).collect();
+                    for (_, entry) in &entries {
+                        println!("─── {} → {} [{}] ───", entry.source, entry.agent, &entry.timestamp[..19.min(entry.timestamp.len())]);
+                        println!("Task: {}", truncate_main(&entry.task, 120));
+                        if let Some(ref result) = entry.result {
+                            println!("{}", result);
+                        }
+                        if let Some(ref error) = entry.error {
+                            println!("ERROR: {}", error);
+                        }
+                        println!();
+                    }
+                    if clear {
+                        inbox::clear(&paths)?;
+                        println!("({} message(s) cleared)", paths.len());
+                    }
+                }
+            }
             AgentAction::Rm { name } => {
                 agent::remove(&name).await?;
                 println!("Agent {} removed", name);
@@ -235,6 +266,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn truncate_main(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &s[..end])
+    }
 }
 
 /// Start per-agent buses and workers for all agents in workspace config.
