@@ -15,16 +15,23 @@ pub struct AgentConfig {
     pub system_prompt: String,
     pub work_dir: String,
     pub max_turns: u32,
-    /// Optional Linux user to run the claude process as.
+    /// Optional Linux user to run the agent process as.
     #[serde(default)]
     pub unix_user: Option<String>,
     /// Budget cap in USD.
     #[serde(default = "default_budget_usd")]
     pub budget_usd: f64,
+    /// Command to run. Defaults to ["claude"].
+    #[serde(default = "default_agent_command")]
+    pub command: Vec<String>,
 }
 
 fn default_budget_usd() -> f64 {
     50.0
+}
+
+fn default_agent_command() -> Vec<String> {
+    vec!["claude".to_string()]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +65,10 @@ fn save_state(state: &AgentState) -> Result<()> {
     let content = serde_yaml::to_string(state)?;
     std::fs::write(&path, content)?;
     Ok(())
+}
+
+pub fn save_state_pub(state: &AgentState) -> Result<()> {
+    save_state(state)
 }
 
 /// Create a new agent (saves state file; does not start a worker process).
@@ -98,6 +109,7 @@ pub async fn create_or_recover(def: &config::AgentDef) -> Result<AgentState> {
         max_turns: def.max_turns,
         unix_user: def.unix_user.clone(),
         budget_usd: def.budget_usd,
+        command: def.command.clone(),
     };
     create(&cfg).await
 }
@@ -198,20 +210,25 @@ pub async fn send(name: &str, message: &str, max_turns: Option<u32>) -> Result<S
     Ok(response_text)
 }
 
-/// Build the tokio Command for running claude, respecting unix_user if set.
-fn build_command(cfg: &AgentConfig, args: &[String]) -> Command {
+/// Build the tokio Command for running the agent process.
+/// Uses cfg.command as the executable (defaults to ["claude"]).
+/// When unix_user is set, wraps with sudo and strips SSH env vars.
+pub fn build_command(cfg: &AgentConfig, args: &[String]) -> Command {
+    let (bin, prefix) = split_command(&cfg.command);
     let mut cmd = match &cfg.unix_user {
         Some(user) => {
             let mut c = Command::new("sudo");
-            c.args(["-u", user, "-H", "--", "claude"]);
+            c.args(["-u", user, "-H", "--"]);
+            c.arg(bin);
+            c.args(prefix);
             c.args(args);
-            // Strip SSH agent socket so the child cannot inherit the parent's keys.
             c.env_remove("SSH_AUTH_SOCK");
             c.env_remove("SSH_AGENT_PID");
             c
         }
         None => {
-            let mut c = Command::new("claude");
+            let mut c = Command::new(bin);
+            c.args(prefix);
             c.args(args);
             c
         }
@@ -220,6 +237,14 @@ fn build_command(cfg: &AgentConfig, args: &[String]) -> Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd
+}
+
+fn split_command(command: &[String]) -> (&str, &[String]) {
+    match command {
+        [] => ("claude", &[]),
+        [bin] => (bin.as_str(), &[]),
+        [bin, rest @ ..] => (bin.as_str(), rest),
+    }
 }
 
 /// List all agents whose state files exist on disk.

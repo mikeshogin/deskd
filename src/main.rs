@@ -53,12 +53,15 @@ enum AgentAction {
         /// Max turns per task.
         #[arg(long, default_value = "100")]
         max_turns: u32,
-        /// Linux user to run claude as (optional).
+        /// Linux user to run the agent process as (optional).
         #[arg(long)]
         unix_user: Option<String>,
         /// Budget cap in USD.
         #[arg(long, default_value = "50.0")]
         budget_usd: f64,
+        /// Command to run as the agent process (default: claude).
+        #[arg(long = "command")]
+        command: Vec<String>,
     },
     /// Send a task to an agent (via bus if running, direct otherwise).
     Send {
@@ -81,8 +84,12 @@ enum AgentAction {
         #[arg(long, default_value = DEFAULT_SOCKET)]
         socket: String,
     },
-    /// List all registered agents with their stats.
-    List,
+    /// List registered agents with their stats (and live status if bus is running).
+    List {
+        /// Bus socket path — when provided, shows which agents are currently connected.
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: String,
+    },
     /// Show detailed stats for an agent.
     Stats {
         /// Agent name.
@@ -119,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
                 max_turns,
                 unix_user,
                 budget_usd,
+                command,
             } => {
                 let cfg = agent::AgentConfig {
                     name: name.clone(),
@@ -128,6 +136,7 @@ async fn main() -> anyhow::Result<()> {
                     max_turns,
                     unix_user,
                     budget_usd,
+                    command: if command.is_empty() { vec!["claude".to_string()] } else { command },
                 };
                 let state = agent::create(&cfg).await?;
                 println!("Agent {} created", state.config.name);
@@ -156,19 +165,24 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            AgentAction::List => {
+            AgentAction::List { socket } => {
                 let agents = agent::list().await?;
+                // Query live connected agents from bus (best-effort).
+                let live = query_live_agents(&socket).await.unwrap_or_default();
+
                 if agents.is_empty() {
                     println!("No agents registered");
                 } else {
                     println!(
-                        "{:<15} {:<8} {:<10} {:<12} {}",
-                        "NAME", "TURNS", "COST", "USER", "MODEL"
+                        "{:<15} {:<7} {:<8} {:<10} {:<12} {}",
+                        "NAME", "STATUS", "TURNS", "COST", "USER", "MODEL"
                     );
                     for a in agents {
+                        let status = if live.contains(&a.config.name) { "live" } else { "idle" };
                         println!(
-                            "{:<15} {:<8} ${:<9.2} {:<12} {}",
+                            "{:<15} {:<7} {:<8} ${:<9.2} {:<12} {}",
                             a.config.name,
+                            status,
                             a.total_turns,
                             a.total_cost,
                             a.config.unix_user.as_deref().unwrap_or("-"),
@@ -217,13 +231,32 @@ async fn serve(socket: String, config_path: Option<String>) -> anyhow::Result<()
         .map(|ws| ws.bus.socket.clone())
         .unwrap_or(socket);
 
-    // Auto-spawn workers for all agents defined in workspace config.
+    // Auto-spawn persistent agents defined in workspace config.
     if let Some(ref ws) = workspace {
         for def in &ws.agents {
+            if !def.persistent {
+                info!(agent = %def.name, "skipping non-persistent agent (on-demand only)");
+                continue;
+            }
+
             let state = agent::create_or_recover(def).await?;
             let name = state.config.name.clone();
+
+            // Each persistent agent gets its own sub-bus for scoped sub-agent spawning.
+            let sub_bus = def.sub_bus_path(&effective_socket);
+            {
+                let sub = sub_bus.clone();
+                let agent_name = name.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = bus::serve(&sub).await {
+                        tracing::error!(agent = %agent_name, socket = %sub, error = %e, "sub-bus failed");
+                    }
+                });
+            }
+            info!(agent = %name, sub_bus = %sub_bus, "started sub-bus for agent");
+
+            // Worker connects to the ROOT bus (receives tasks from external world).
             let sock = effective_socket.clone();
-            info!(agent = %name, "launching worker");
             tokio::spawn(async move {
                 if let Err(e) = worker::run(&name, &sock).await {
                     tracing::error!(agent = %name, error = %e, "worker exited with error");
@@ -232,7 +265,7 @@ async fn serve(socket: String, config_path: Option<String>) -> anyhow::Result<()
         }
     }
 
-    info!(socket = %effective_socket, "starting bus");
+    info!(socket = %effective_socket, "starting root bus");
     tokio::select! {
         result = bus::serve(&effective_socket) => { result?; }
         _ = tokio::signal::ctrl_c() => {
@@ -241,4 +274,48 @@ async fn serve(socket: String, config_path: Option<String>) -> anyhow::Result<()
     }
 
     Ok(())
+}
+
+/// Query the bus for currently connected agent names.
+/// Returns empty vec if the bus is not running or unreachable.
+async fn query_live_agents(socket_path: &str) -> anyhow::Result<std::collections::HashSet<String>> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    if !std::path::Path::new(socket_path).exists() {
+        return Ok(Default::default());
+    }
+
+    let mut stream = UnixStream::connect(socket_path).await?;
+
+    // Register as transient query client.
+    let reg = serde_json::json!({"type": "register", "name": "cli-list-query", "subscriptions": []});
+    let mut line = serde_json::to_string(&reg)?;
+    line.push('\n');
+    stream.write_all(line.as_bytes()).await?;
+
+    // Send list query.
+    let query = serde_json::json!({"type": "list"});
+    let mut qline = serde_json::to_string(&query)?;
+    qline.push('\n');
+    stream.write_all(qline.as_bytes()).await?;
+
+    // Read the response (one message).
+    let (reader, _) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    let timeout = tokio::time::Duration::from_secs(2);
+    let resp_line = tokio::time::timeout(timeout, lines.next_line()).await??;
+
+    if let Some(line) = resp_line {
+        let v: serde_json::Value = serde_json::from_str(&line)?;
+        if let Some(arr) = v["payload"]["clients"].as_array() {
+            return Ok(arr.iter()
+                .filter_map(|c| c.as_str())
+                .map(|s| s.to_string())
+                .collect());
+        }
+    }
+
+    Ok(Default::default())
 }

@@ -72,13 +72,47 @@ pub struct AgentDef {
     #[serde(default)]
     pub system_prompt: String,
     pub work_dir: String,
-    /// Optional Linux user to run the claude process as.
+    /// Optional Linux user to run the agent process as.
     pub unix_user: Option<String>,
     #[serde(default = "default_max_turns")]
     pub max_turns: u32,
     /// Budget cap in USD. Worker rejects tasks when this is exceeded.
     #[serde(default = "default_budget_usd")]
     pub budget_usd: f64,
+    /// Command to run as the agent process. Defaults to ["claude"].
+    #[serde(default = "default_command")]
+    pub command: Vec<String>,
+    /// Persistent agents are auto-started on `deskd serve` and restarted on
+    /// crash. Non-persistent agents are spawned on demand. Default: true.
+    #[serde(default = "default_persistent")]
+    pub persistent: bool,
+    /// Socket path for this agent's own sub-bus.
+    /// Sub-agents spawned by this agent connect here, not to the root bus.
+    /// If None, auto-derived as `{bus_dir}/{name}.sock`.
+    pub sub_bus_socket: Option<String>,
+}
+
+fn default_command() -> Vec<String> {
+    vec!["claude".to_string()]
+}
+
+fn default_persistent() -> bool {
+    true
+}
+
+impl AgentDef {
+    /// Compute the sub-bus socket path for this agent.
+    pub fn sub_bus_path(&self, root_bus: &str) -> String {
+        if let Some(ref p) = self.sub_bus_socket {
+            return p.clone();
+        }
+        let root = std::path::Path::new(root_bus);
+        let dir = root.parent().unwrap_or(std::path::Path::new("/tmp"));
+        let stem = root.file_stem().and_then(|s| s.to_str()).unwrap_or("deskd");
+        dir.join(format!("{}-{}.sock", stem, self.name))
+            .to_string_lossy()
+            .into_owned()
+    }
 }
 
 impl WorkspaceConfig {
@@ -184,5 +218,66 @@ agents:
         let cfg: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.agents[0].unix_user.as_deref(), Some("agent-kira"));
         assert_eq!(cfg.agents[0].budget_usd, 25.0);
+    }
+
+    #[test]
+    fn test_agent_def_persistent_default() {
+        let yaml = r#"
+agents:
+  - name: kira
+    model: claude-opus-4-6
+    work_dir: /tmp
+"#;
+        let cfg: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.agents[0].persistent, "persistent should default to true");
+        assert!(cfg.agents[0].sub_bus_socket.is_none());
+    }
+
+    #[test]
+    fn test_agent_def_non_persistent() {
+        let yaml = r#"
+agents:
+  - name: worker
+    model: claude-opus-4-6
+    work_dir: /tmp
+    persistent: false
+"#;
+        let cfg: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!cfg.agents[0].persistent);
+    }
+
+    #[test]
+    fn test_sub_bus_path_auto_derived() {
+        let def = AgentDef {
+            name: "kira".to_string(),
+            model: "m".to_string(),
+            system_prompt: String::new(),
+            work_dir: "/tmp".to_string(),
+            unix_user: None,
+            max_turns: 100,
+            budget_usd: 50.0,
+            command: vec!["claude".to_string()],
+            persistent: true,
+            sub_bus_socket: None,
+        };
+        assert_eq!(def.sub_bus_path("/run/deskd/root.sock"), "/run/deskd/root-kira.sock");
+        assert_eq!(def.sub_bus_path("/tmp/deskd.sock"), "/tmp/deskd-kira.sock");
+    }
+
+    #[test]
+    fn test_sub_bus_path_explicit() {
+        let def = AgentDef {
+            name: "kira".to_string(),
+            model: "m".to_string(),
+            system_prompt: String::new(),
+            work_dir: "/tmp".to_string(),
+            unix_user: None,
+            max_turns: 100,
+            budget_usd: 50.0,
+            command: vec!["claude".to_string()],
+            persistent: true,
+            sub_bus_socket: Some("/custom/kira.sock".to_string()),
+        };
+        assert_eq!(def.sub_bus_path("/run/deskd/root.sock"), "/custom/kira.sock");
     }
 }

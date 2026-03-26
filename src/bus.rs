@@ -28,6 +28,10 @@ impl BusState {
         }
     }
 
+    fn list_clients(&self) -> Vec<String> {
+        self.clients.keys().cloned().collect()
+    }
+
     fn route(&self, msg: &Message) {
         let target = &msg.target;
 
@@ -174,6 +178,21 @@ async fn handle_connection(stream: UnixStream, state: Arc<RwLock<BusState>>) -> 
             }
             Envelope::Register(_) => {
                 warn!(client = %name, "ignoring duplicate register");
+            }
+            Envelope::List => {
+                let bus = state.read().await;
+                let clients = bus.list_clients();
+                if let Some(client) = bus.clients.get(&name) {
+                    let resp = Message {
+                        id: "list-response".to_string(),
+                        source: "bus".to_string(),
+                        target: name.clone(),
+                        payload: serde_json::json!({"type": "list_response", "clients": clients}),
+                        reply_to: None,
+                        metadata: crate::message::Metadata::default(),
+                    };
+                    let _ = client.tx.send(resp);
+                }
             }
         }
     }

@@ -34,6 +34,8 @@ fn default_priority() -> u8 {
 pub enum Envelope {
     Register(Register),
     Message(Message),
+    /// Query: list currently connected agents on this bus.
+    List,
 }
 
 #[cfg(test)]
