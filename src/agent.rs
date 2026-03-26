@@ -42,6 +42,10 @@ pub struct AgentState {
     pub total_turns: u32,
     pub total_cost: f64,
     pub created_at: String,
+    /// The Unix socket path of this agent's own sub-bus.
+    /// Set at serve time; used by `deskd agent send` to route without specifying --socket.
+    #[serde(default)]
+    pub sub_bus: Option<String>,
 }
 
 fn state_path(name: &str) -> PathBuf {
@@ -84,6 +88,7 @@ pub async fn create(cfg: &AgentConfig) -> Result<AgentState> {
         total_turns: 0,
         total_cost: 0.0,
         created_at: Utc::now().to_rfc3339(),
+        sub_bus: None,
     };
 
     save_state(&state)?;
@@ -92,12 +97,15 @@ pub async fn create(cfg: &AgentConfig) -> Result<AgentState> {
 }
 
 /// Create or recover agent state from a workspace AgentDef.
-/// If state already exists on disk, returns existing state (preserving session_id + costs).
-pub async fn create_or_recover(def: &config::AgentDef) -> Result<AgentState> {
+/// If state already exists on disk, returns existing state and updates sub_bus path.
+pub async fn create_or_recover(def: &config::AgentDef, sub_bus: &str) -> Result<AgentState> {
     let path = state_path(&def.name);
     if path.exists() {
-        let state = load_state(&def.name)?;
-        info!(agent = %def.name, session_id = %state.session_id, "recovered existing agent state");
+        let mut state = load_state(&def.name)?;
+        // Always update sub_bus — socket paths can change between runs.
+        state.sub_bus = Some(sub_bus.to_string());
+        save_state(&state)?;
+        info!(agent = %def.name, session_id = %state.session_id, sub_bus = %sub_bus, "recovered existing agent state");
         return Ok(state);
     }
 
@@ -111,7 +119,19 @@ pub async fn create_or_recover(def: &config::AgentDef) -> Result<AgentState> {
         budget_usd: def.budget_usd,
         command: def.command.clone(),
     };
-    create(&cfg).await
+    let mut state = AgentState {
+        config: cfg,
+        pid: 0,
+        session_id: String::new(),
+        total_turns: 0,
+        total_cost: 0.0,
+        created_at: Utc::now().to_rfc3339(),
+        sub_bus: Some(sub_bus.to_string()),
+    };
+    save_state(&state)?;
+    info!(agent = %def.name, sub_bus = %sub_bus, "agent created");
+    state.config.name = def.name.clone(); // ensure
+    Ok(state)
 }
 
 /// Send a message to an agent — runs claude CLI and returns the full response text.
@@ -402,6 +422,7 @@ created_at: "2026-01-01T00:00:00Z"
             total_turns: 5,
             total_cost: 0.42,
             created_at: Utc::now().to_rfc3339(),
+            sub_bus: Some("/run/deskd/root-test-agent.sock".to_string()),
         };
         let yaml = serde_yaml::to_string(&state).unwrap();
         let restored: AgentState = serde_yaml::from_str(&yaml).unwrap();

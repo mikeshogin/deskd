@@ -32,8 +32,6 @@ pub struct WorkspaceConfig {
     #[serde(default)]
     pub bus: BusConfig,
     #[serde(default)]
-    pub adapters: AdaptersConfig,
-    #[serde(default)]
     pub agents: Vec<AgentDef>,
 }
 
@@ -55,13 +53,10 @@ impl Default for BusConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AdaptersConfig {
-    pub telegram: Option<TelegramConfig>,
-}
-
+/// Telegram bot adapter config. Defined per-agent — each agent can have its own bot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelegramConfig {
+    /// Bot token from @BotFather. Typically set via ${TELEGRAM_BOT_TOKEN}.
     pub token: String,
 }
 
@@ -87,9 +82,13 @@ pub struct AgentDef {
     #[serde(default = "default_persistent")]
     pub persistent: bool,
     /// Socket path for this agent's own sub-bus.
-    /// Sub-agents spawned by this agent connect here, not to the root bus.
-    /// If None, auto-derived as `{bus_dir}/{name}.sock`.
+    /// The agent's worker, Telegram adapter, and sub-agents all connect here.
+    /// If None, auto-derived as `{bus_dir}/{root_stem}-{name}.sock`.
     pub sub_bus_socket: Option<String>,
+    /// Optional Telegram bot for this agent.
+    /// When set, a Telegram adapter is started on this agent's sub-bus.
+    /// Messages arrive as queue:tasks; replies go back to the sender chat.
+    pub telegram: Option<TelegramConfig>,
 }
 
 fn default_command() -> Vec<String> {
@@ -202,6 +201,7 @@ agents:
         assert_eq!(cfg.agents[0].max_turns, 100);
         assert_eq!(cfg.agents[0].budget_usd, 50.0);
         assert!(cfg.agents[0].unix_user.is_none());
+        assert!(cfg.agents[0].telegram.is_none());
         assert_eq!(cfg.bus.socket, "/tmp/deskd.sock");
     }
 
@@ -247,6 +247,25 @@ agents:
     }
 
     #[test]
+    fn test_workspace_config_per_agent_telegram() {
+        let yaml = r#"
+agents:
+  - name: kira
+    model: claude-opus-4-6
+    work_dir: /tmp
+    telegram:
+      token: "bot-token-123"
+  - name: assistant
+    model: claude-sonnet-4-6
+    work_dir: /tmp
+"#;
+        let cfg: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.agents[0].telegram.is_some());
+        assert_eq!(cfg.agents[0].telegram.as_ref().unwrap().token, "bot-token-123");
+        assert!(cfg.agents[1].telegram.is_none());
+    }
+
+    #[test]
     fn test_sub_bus_path_auto_derived() {
         let def = AgentDef {
             name: "kira".to_string(),
@@ -259,6 +278,7 @@ agents:
             command: vec!["claude".to_string()],
             persistent: true,
             sub_bus_socket: None,
+            telegram: None,
         };
         assert_eq!(def.sub_bus_path("/run/deskd/root.sock"), "/run/deskd/root-kira.sock");
         assert_eq!(def.sub_bus_path("/tmp/deskd.sock"), "/tmp/deskd-kira.sock");
@@ -277,6 +297,7 @@ agents:
             command: vec!["claude".to_string()],
             persistent: true,
             sub_bus_socket: Some("/custom/kira.sock".to_string()),
+            telegram: None,
         };
         assert_eq!(def.sub_bus_path("/run/deskd/root.sock"), "/custom/kira.sock");
     }

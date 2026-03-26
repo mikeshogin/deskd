@@ -168,9 +168,17 @@ async fn main() -> anyhow::Result<()> {
                 max_turns,
                 socket,
             } => {
-                if std::path::Path::new(&socket).exists() {
+                // Socket priority: explicit --socket flag > agent's sub_bus from state > direct exec.
+                let effective_socket = if std::path::Path::new(&socket).exists() {
+                    Some(socket)
+                } else {
+                    // Try to find the agent's sub-bus from its state file.
+                    agent::load_state(&name).ok().and_then(|s| s.sub_bus).filter(|p| std::path::Path::new(p).exists())
+                };
+
+                if let Some(sock) = effective_socket {
                     let target = format!("agent:{}", name);
-                    worker::send_via_bus(&socket, "cli", &target, &message, max_turns).await?;
+                    worker::send_via_bus(&sock, "cli", &target, &message, max_turns).await?;
                 } else {
                     let response = agent::send(&name, &message, max_turns, None).await?;
                     println!("{}", response);
@@ -291,11 +299,15 @@ async fn serve(socket: String, config_path: Option<String>) -> anyhow::Result<()
                 continue;
             }
 
-            let state = agent::create_or_recover(def).await?;
+            // Derive agent's sub-bus path before creating state (sub_bus is stored in state).
+            let sub_bus = def.sub_bus_path(&effective_socket);
+            let state = agent::create_or_recover(def, &sub_bus).await?;
             let name = state.config.name.clone();
 
-            // Each persistent agent gets its own sub-bus for scoped sub-agent spawning.
-            let sub_bus = def.sub_bus_path(&effective_socket);
+            // Start the agent's sub-bus. This is the agent's primary bus:
+            //   - worker subscribes here for tasks
+            //   - Telegram adapter (if configured) posts here
+            //   - sub-agents spawned by this agent connect here
             {
                 let sub = sub_bus.clone();
                 let agent_name = name.clone();
@@ -307,12 +319,20 @@ async fn serve(socket: String, config_path: Option<String>) -> anyhow::Result<()
             }
             info!(agent = %name, sub_bus = %sub_bus, "started sub-bus for agent");
 
-            // Worker connects to the ROOT bus (receives tasks from external world).
-            // sub_bus is injected as DESKD_SUB_BUS into the claude subprocess.
-            let sock = effective_socket.clone();
-            let sub_bus_for_worker = Some(sub_bus.clone());
+            // Start Telegram adapter on the agent's sub-bus if configured.
+            // The adapter posts inbound messages as queue:tasks and subscribes to telegram:*
+            // for outbound replies. Wired up when feat/telegram-adapter is merged.
+            if let Some(ref tg) = def.telegram {
+                info!(agent = %name, "telegram adapter configured (token present), will start on sub-bus");
+                let _ = tg; // adapter startup: adapters::telegram::run(tg.clone(), &sub_bus)
+                //           will be activated once the telegram module is available on this branch.
+            }
+
+            // Worker subscribes to agent's sub-bus (agent's primary bus).
+            // DESKD_SUB_BUS is still passed for sub-agent spawning (same path here).
+            let sub = sub_bus.clone();
             tokio::spawn(async move {
-                if let Err(e) = worker::run(&name, &sock, sub_bus_for_worker).await {
+                if let Err(e) = worker::run(&name, &sub, Some(sub.clone())).await {
                     tracing::error!(agent = %name, error = %e, "worker exited with error");
                 }
             });
