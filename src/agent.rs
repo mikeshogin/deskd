@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::process::Command;
+use tracing::{debug, info, warn};
 
 use crate::config;
 
@@ -14,6 +15,16 @@ pub struct AgentConfig {
     pub system_prompt: String,
     pub work_dir: String,
     pub max_turns: u32,
+    /// Optional Linux user to run the claude process as.
+    #[serde(default)]
+    pub unix_user: Option<String>,
+    /// Budget cap in USD.
+    #[serde(default = "default_budget_usd")]
+    pub budget_usd: f64,
+}
+
+fn default_budget_usd() -> f64 {
+    50.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,16 +60,15 @@ fn save_state(state: &AgentState) -> Result<()> {
     Ok(())
 }
 
-/// Create a new agent — spawns claude as a background process.
+/// Create a new agent (saves state file; does not start a worker process).
 pub async fn create(cfg: &AgentConfig) -> Result<AgentState> {
-    // Check if already exists
     if state_path(&cfg.name).exists() {
         bail!("Agent '{}' already exists. Remove it first.", cfg.name);
     }
 
     let state = AgentState {
         config: cfg.clone(),
-        pid: 0, // no persistent process — we run claude per-task
+        pid: 0,
         session_id: String::new(),
         total_turns: 0,
         total_cost: 0.0,
@@ -66,18 +76,41 @@ pub async fn create(cfg: &AgentConfig) -> Result<AgentState> {
     };
 
     save_state(&state)?;
+    info!(agent = %cfg.name, "agent created");
     Ok(state)
 }
 
-/// Send a message to an agent — runs claude CLI and returns response.
+/// Create or recover agent state from a workspace AgentDef.
+/// If state already exists on disk, returns existing state (preserving session_id + costs).
+pub async fn create_or_recover(def: &config::AgentDef) -> Result<AgentState> {
+    let path = state_path(&def.name);
+    if path.exists() {
+        let state = load_state(&def.name)?;
+        info!(agent = %def.name, session_id = %state.session_id, "recovered existing agent state");
+        return Ok(state);
+    }
+
+    let cfg = AgentConfig {
+        name: def.name.clone(),
+        model: def.model.clone(),
+        system_prompt: def.system_prompt.clone(),
+        work_dir: def.work_dir.clone(),
+        max_turns: def.max_turns,
+        unix_user: def.unix_user.clone(),
+        budget_usd: def.budget_usd,
+    };
+    create(&cfg).await
+}
+
+/// Send a message to an agent — runs claude CLI and returns the full response text.
 pub async fn send(name: &str, message: &str, max_turns: Option<u32>) -> Result<String> {
     let mut state = load_state(name)?;
 
     let turns = max_turns.unwrap_or(state.config.max_turns);
 
-    // All flags must come before -p <message> to avoid messages starting with '-'
-    // being parsed as flags.
     let mut args = vec![
+        "-p".to_string(),
+        message.to_string(),
         "--output-format".to_string(),
         "stream-json".to_string(),
         "--verbose".to_string(),
@@ -98,22 +131,16 @@ pub async fn send(name: &str, message: &str, max_turns: Option<u32>) -> Result<S
         args.push(state.config.system_prompt.clone());
     }
 
-    // -p <message> must be last to avoid messages starting with '-' being parsed as flags
-    args.push("-p".to_string());
-    args.push(message.to_string());
+    debug!(agent = %name, turns, "spawning claude");
 
-    let output = Command::new("claude")
-        .args(&args)
-        .current_dir(&state.config.work_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+    let mut cmd = build_command(&state.config, &args);
+    let output = cmd
         .output()
         .await
         .context("Failed to run claude CLI")?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // Parse stream-json output — last line with type=result has cost/session info
     let mut response_text = String::new();
     let mut new_session_id = String::new();
     let mut task_cost = 0.0;
@@ -123,15 +150,15 @@ pub async fn send(name: &str, message: &str, max_turns: Option<u32>) -> Result<S
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
             match v.get("type").and_then(|t| t.as_str()) {
                 Some("assistant") => {
-                    // Extract text from content blocks
-                    if let Some(content) = v.get("message").and_then(|m| m.get("content")) {
-                        if let Some(blocks) = content.as_array() {
-                            for block in blocks {
-                                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                                    if let Some(text) = block.get("text").and_then(|t| t.as_str())
-                                    {
-                                        response_text.push_str(text);
-                                    }
+                    if let Some(blocks) = v
+                        .get("message")
+                        .and_then(|m| m.get("content"))
+                        .and_then(|c| c.as_array())
+                    {
+                        for block in blocks {
+                            if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                    response_text.push_str(text);
                                 }
                             }
                         }
@@ -144,8 +171,8 @@ pub async fn send(name: &str, message: &str, max_turns: Option<u32>) -> Result<S
                     if let Some(cost) = v.get("total_cost_usd").and_then(|c| c.as_f64()) {
                         task_cost = cost;
                     }
-                    if let Some(turns) = v.get("num_turns").and_then(|t| t.as_u64()) {
-                        task_turns = turns as u32;
+                    if let Some(t) = v.get("num_turns").and_then(|t| t.as_u64()) {
+                        task_turns = t as u32;
                     }
                 }
                 _ => {}
@@ -153,7 +180,6 @@ pub async fn send(name: &str, message: &str, max_turns: Option<u32>) -> Result<S
         }
     }
 
-    // Update state
     if !new_session_id.is_empty() {
         state.session_id = new_session_id;
     }
@@ -172,7 +198,31 @@ pub async fn send(name: &str, message: &str, max_turns: Option<u32>) -> Result<S
     Ok(response_text)
 }
 
-/// List all agents.
+/// Build the tokio Command for running claude, respecting unix_user if set.
+fn build_command(cfg: &AgentConfig, args: &[String]) -> Command {
+    let mut cmd = match &cfg.unix_user {
+        Some(user) => {
+            let mut c = Command::new("sudo");
+            c.args(["-u", user, "-H", "--", "claude"]);
+            c.args(args);
+            // Strip SSH agent socket so the child cannot inherit the parent's keys.
+            c.env_remove("SSH_AUTH_SOCK");
+            c.env_remove("SSH_AGENT_PID");
+            c
+        }
+        None => {
+            let mut c = Command::new("claude");
+            c.args(args);
+            c
+        }
+    };
+    cmd.current_dir(&cfg.work_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
+
+/// List all agents whose state files exist on disk.
 pub async fn list() -> Result<Vec<AgentState>> {
     let dir = config::state_dir();
     let mut agents = Vec::new();
@@ -193,21 +243,93 @@ pub async fn list() -> Result<Vec<AgentState>> {
     Ok(agents)
 }
 
-/// Remove an agent.
+/// Remove an agent (state file + log).
 pub async fn remove(name: &str) -> Result<()> {
     let path = state_path(name);
     if !path.exists() {
         bail!("Agent '{}' not found", name);
     }
-
-    // Remove state file
     std::fs::remove_file(&path)?;
-
-    // Remove log file if exists
     let log = log_path(name);
     if log.exists() {
-        std::fs::remove_file(&log).ok();
+        if let Err(e) = std::fs::remove_file(&log) {
+            warn!(agent = %name, error = %e, "failed to remove log file");
+        }
+    }
+    info!(agent = %name, "agent removed");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_agent_config_defaults() {
+        let yaml = r#"
+config:
+  name: test
+  model: claude-opus-4-6
+  system_prompt: ""
+  work_dir: /tmp
+  max_turns: 100
+pid: 0
+session_id: ""
+total_turns: 0
+total_cost: 0.0
+created_at: "2026-01-01T00:00:00Z"
+"#;
+        let state: AgentState = serde_yaml::from_str(yaml).unwrap();
+        assert!(state.config.unix_user.is_none());
+        assert_eq!(state.config.budget_usd, 50.0);
     }
 
-    Ok(())
+    #[test]
+    fn test_agent_config_with_unix_user() {
+        let yaml = r#"
+config:
+  name: kira
+  model: claude-opus-4-6
+  system_prompt: "You are Kira."
+  work_dir: /home/agent-kira
+  max_turns: 50
+  unix_user: agent-kira
+  budget_usd: 25.0
+pid: 0
+session_id: "sess-abc"
+total_turns: 10
+total_cost: 1.23
+created_at: "2026-01-01T00:00:00Z"
+"#;
+        let state: AgentState = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(state.config.unix_user.as_deref(), Some("agent-kira"));
+        assert_eq!(state.config.budget_usd, 25.0);
+        assert_eq!(state.session_id, "sess-abc");
+    }
+
+    #[test]
+    fn test_agent_state_round_trip() {
+        let cfg = AgentConfig {
+            name: "test-agent".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
+            system_prompt: String::new(),
+            work_dir: "/tmp".to_string(),
+            max_turns: 100,
+            unix_user: Some("agent1".to_string()),
+            budget_usd: 10.0,
+        };
+        let state = AgentState {
+            config: cfg,
+            pid: 0,
+            session_id: "sid-123".to_string(),
+            total_turns: 5,
+            total_cost: 0.42,
+            created_at: Utc::now().to_rfc3339(),
+        };
+        let yaml = serde_yaml::to_string(&state).unwrap();
+        let restored: AgentState = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(restored.config.unix_user.as_deref(), Some("agent1"));
+        assert_eq!(restored.session_id, "sid-123");
+        assert_eq!(restored.total_cost, 0.42);
+    }
 }

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, RwLock};
+use tracing::{debug, info, warn};
 
 use crate::message::{Envelope, Message};
 
@@ -40,7 +41,7 @@ impl BusState {
             if let Some(client) = self.clients.get(name) {
                 let _ = client.tx.send(msg.clone());
             } else {
-                eprintln!("[bus] no such agent: {}", name);
+                warn!(target = %name, "no such agent on bus");
             }
         } else if target.starts_with("queue:") {
             for client in self.clients.values() {
@@ -64,9 +65,9 @@ impl BusState {
                 }
             }
             if delivered {
-                eprintln!("[bus] delivered to subscriber via pattern match for target: {}", target);
+                debug!(target = %target, "delivered via pattern match");
             } else {
-                eprintln!("[bus] no subscriber for target: {}", target);
+                warn!(target = %target, "no subscriber for target");
             }
         }
     }
@@ -89,7 +90,7 @@ pub async fn serve(socket_path: &str) -> Result<()> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))?;
     }
 
-    eprintln!("[bus] listening on {}", socket_path);
+    info!(socket = %socket_path, "bus listening");
 
     let state = Arc::new(RwLock::new(BusState::new()));
 
@@ -98,7 +99,7 @@ pub async fn serve(socket_path: &str) -> Result<()> {
         let state = Arc::clone(&state);
         tokio::spawn(async move {
             if let Err(e) = handle_connection(stream, state).await {
-                eprintln!("[bus] connection error: {}", e);
+                warn!(error = %e, "connection error");
             }
         });
     }
@@ -126,7 +127,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<RwLock<BusState>>) -> 
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
 
-    eprintln!("[bus] client registered: {}", name);
+    info!(client = %name, "client registered");
 
     {
         let mut bus = state.write().await;
@@ -160,25 +161,25 @@ async fn handle_connection(stream: UnixStream, state: Arc<RwLock<BusState>>) -> 
         let envelope: Envelope = match serde_json::from_str(&line) {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("[bus] invalid message from {}: {}", name, e);
+                warn!(client = %name, error = %e, "invalid message");
                 continue;
             }
         };
 
         match envelope {
             Envelope::Message(msg) => {
-                eprintln!("[bus] routing message from {} to {}", msg.source, msg.target);
+                debug!(from = %msg.source, to = %msg.target, "routing message");
                 let bus = state.read().await;
                 bus.route(&msg);
             }
             Envelope::Register(_) => {
-                eprintln!("[bus] ignoring duplicate register from {}", name);
+                warn!(client = %name, "ignoring duplicate register");
             }
         }
     }
 
     // Client disconnected
-    eprintln!("[bus] client disconnected: {}", name);
+    info!(client = %name, "client disconnected");
     {
         let mut bus = state.write().await;
         bus.clients.remove(&name);

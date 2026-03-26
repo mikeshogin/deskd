@@ -5,6 +5,7 @@ mod message;
 mod worker;
 
 use clap::{Parser, Subcommand};
+use tracing::info;
 
 const DEFAULT_SOCKET: &str = "/tmp/deskd.sock";
 
@@ -17,78 +18,98 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Create and start a new agent
+    /// Start the message bus server and launch configured agents.
+    Serve {
+        /// Unix socket path for the bus.
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: String,
+        /// Path to workspace config file (workspace.yaml).
+        /// When provided, agents listed in the config are auto-started.
+        #[arg(long)]
+        config: Option<String>,
+    },
+    /// Manage agents.
     Agent {
         #[command(subcommand)]
         action: AgentAction,
-    },
-    /// Start the message bus server
-    Serve {
-        /// Unix socket path
-        #[arg(long, default_value = DEFAULT_SOCKET)]
-        socket: String,
     },
 }
 
 #[derive(Subcommand)]
 enum AgentAction {
-    /// Create a new agent
+    /// Register a new agent (saves state file, does not start worker).
     Create {
-        /// Agent name
+        /// Agent name.
         name: String,
-        /// System prompt
+        /// System prompt text.
         #[arg(long)]
         prompt: Option<String>,
-        /// Model to use
-        #[arg(long, default_value = "claude-sonnet-4-20250514")]
+        /// Claude model to use.
+        #[arg(long, default_value = "claude-sonnet-4-6")]
         model: String,
-        /// Working directory
+        /// Working directory for claude.
         #[arg(long)]
         workdir: Option<String>,
-        /// Max turns per task
+        /// Max turns per task.
         #[arg(long, default_value = "100")]
         max_turns: u32,
+        /// Linux user to run claude as (optional).
+        #[arg(long)]
+        unix_user: Option<String>,
+        /// Budget cap in USD.
+        #[arg(long, default_value = "50.0")]
+        budget_usd: f64,
     },
-    /// Send a message to an agent
+    /// Send a task to an agent (via bus if running, direct otherwise).
     Send {
-        /// Agent name
+        /// Agent name.
         name: String,
-        /// Message to send
+        /// Task message to send.
         message: String,
-        /// Max turns for this task
+        /// Max turns for this task.
         #[arg(long)]
         max_turns: Option<u32>,
-        /// Bus socket path
+        /// Bus socket path.
         #[arg(long, default_value = DEFAULT_SOCKET)]
         socket: String,
     },
-    /// Run agent worker loop (connects to bus, processes tasks)
+    /// Start the worker loop for an agent (connect to bus, process tasks).
     Run {
-        /// Agent name
+        /// Agent name.
         name: String,
-        /// Bus socket path
+        /// Bus socket path.
         #[arg(long, default_value = DEFAULT_SOCKET)]
         socket: String,
     },
-    /// List all agents
+    /// List all registered agents with their stats.
     List,
-    /// Show agent stats (turns, cost)
+    /// Show detailed stats for an agent.
     Stats {
-        /// Agent name
+        /// Agent name.
         name: String,
     },
-    /// Remove an agent
+    /// Remove an agent (state file + log).
     Rm {
-        /// Agent name
+        /// Agent name.
         name: String,
     },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Serve { socket, config } => {
+            serve(socket, config).await?;
+        }
         Commands::Agent { action } => match action {
             AgentAction::Create {
                 name,
@@ -96,6 +117,8 @@ async fn main() -> anyhow::Result<()> {
                 model,
                 workdir,
                 max_turns,
+                unix_user,
+                budget_usd,
             } => {
                 let cfg = agent::AgentConfig {
                     name: name.clone(),
@@ -103,9 +126,11 @@ async fn main() -> anyhow::Result<()> {
                     system_prompt: prompt.unwrap_or_default(),
                     work_dir: workdir.unwrap_or_else(|| ".".into()),
                     max_turns,
+                    unix_user,
+                    budget_usd,
                 };
                 let state = agent::create(&cfg).await?;
-                println!("Agent {} created (pid: {})", name, state.pid);
+                println!("Agent {} created", state.config.name);
             }
             AgentAction::Send {
                 name,
@@ -113,10 +138,8 @@ async fn main() -> anyhow::Result<()> {
                 max_turns,
                 socket,
             } => {
-                // If bus socket exists, route through bus; otherwise direct
                 if std::path::Path::new(&socket).exists() {
-                    // If name contains ':', treat as raw target (e.g. telegram:-123)
-                    let target = if name.contains(':') { name.clone() } else { format!("agent:{}", name) };
+                    let target = format!("agent:{}", name);
                     worker::send_via_bus(&socket, "cli", &target, &message, max_turns).await?;
                 } else {
                     let response = agent::send(&name, &message, max_turns).await?;
@@ -124,49 +147,96 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             AgentAction::Run { name, socket } => {
-                // Verify agent exists
                 agent::load_state(&name)?;
-
-                eprintln!("[deskd] starting worker for agent '{}'", name);
+                info!(agent = %name, "starting worker");
                 tokio::select! {
-                    result = worker::run(&name, &socket) => {
-                        result?;
-                    }
+                    result = worker::run(&name, &socket) => { result?; }
                     _ = tokio::signal::ctrl_c() => {
-                        eprintln!("\n[deskd] shutting down agent '{}'", name);
+                        info!(agent = %name, "shutting down");
                     }
                 }
             }
             AgentAction::List => {
                 let agents = agent::list().await?;
                 if agents.is_empty() {
-                    println!("No agents running");
+                    println!("No agents registered");
                 } else {
-                    println!("{:<15} {:<10} {:<8} {:<10} {}", "NAME", "PID", "TURNS", "COST", "MODEL");
+                    println!(
+                        "{:<15} {:<8} {:<10} {:<12} {}",
+                        "NAME", "TURNS", "COST", "USER", "MODEL"
+                    );
                     for a in agents {
                         println!(
-                            "{:<15} {:<10} {:<8} ${:<9.2} {}",
-                            a.config.name, a.pid, a.total_turns, a.total_cost, a.config.model
+                            "{:<15} {:<8} ${:<9.2} {:<12} {}",
+                            a.config.name,
+                            a.total_turns,
+                            a.total_cost,
+                            a.config.unix_user.as_deref().unwrap_or("-"),
+                            a.config.model,
                         );
                     }
                 }
             }
             AgentAction::Stats { name } => {
-                let state = agent::load_state(&name)?;
-                println!("Agent: {}", state.config.name);
-                println!("Model: {}", state.config.model);
-                println!("PID: {}", state.pid);
-                println!("Total turns: {}", state.total_turns);
-                println!("Total cost: ${:.4}", state.total_cost);
-                println!("Created: {}", state.created_at);
+                let s = agent::load_state(&name)?;
+                println!("Agent:      {}", s.config.name);
+                println!("Model:      {}", s.config.model);
+                println!("Unix user:  {}", s.config.unix_user.as_deref().unwrap_or("-"));
+                println!("Work dir:   {}", s.config.work_dir);
+                println!("Total turns:{}", s.total_turns);
+                println!("Total cost: ${:.4}", s.total_cost);
+                println!("Budget:     ${:.2}", s.config.budget_usd);
+                println!(
+                    "Session:    {}",
+                    if s.session_id.is_empty() { "-" } else { &s.session_id }
+                );
+                println!("Created:    {}", s.created_at);
             }
             AgentAction::Rm { name } => {
                 agent::remove(&name).await?;
                 println!("Agent {} removed", name);
             }
         },
-        Commands::Serve { socket } => {
-            bus::serve(&socket).await?;
+    }
+
+    Ok(())
+}
+
+async fn serve(socket: String, config_path: Option<String>) -> anyhow::Result<()> {
+    let workspace = if let Some(path) = config_path {
+        let ws = config::WorkspaceConfig::load(&path)?;
+        info!(path = %path, agents = ws.agents.len(), "loaded workspace config");
+        Some(ws)
+    } else {
+        None
+    };
+
+    // Workspace config overrides the CLI --socket flag.
+    let effective_socket = workspace
+        .as_ref()
+        .map(|ws| ws.bus.socket.clone())
+        .unwrap_or(socket);
+
+    // Auto-spawn workers for all agents defined in workspace config.
+    if let Some(ref ws) = workspace {
+        for def in &ws.agents {
+            let state = agent::create_or_recover(def).await?;
+            let name = state.config.name.clone();
+            let sock = effective_socket.clone();
+            info!(agent = %name, "launching worker");
+            tokio::spawn(async move {
+                if let Err(e) = worker::run(&name, &sock).await {
+                    tracing::error!(agent = %name, error = %e, "worker exited with error");
+                }
+            });
+        }
+    }
+
+    info!(socket = %effective_socket, "starting bus");
+    tokio::select! {
+        result = bus::serve(&effective_socket) => { result?; }
+        _ = tokio::signal::ctrl_c() => {
+            info!("shutting down");
         }
     }
 
