@@ -15,12 +15,19 @@ pub struct AgentConfig {
     pub system_prompt: String,
     pub work_dir: String,
     pub max_turns: u32,
-    /// Optional Linux user to run the claude process as.
+    /// Optional Linux user to run the agent process as.
     #[serde(default)]
     pub unix_user: Option<String>,
     /// Budget cap in USD.
     #[serde(default = "default_budget_usd")]
     pub budget_usd: f64,
+    /// Command to run as the agent process. Defaults to ["claude"].
+    #[serde(default = "default_agent_command")]
+    pub command: Vec<String>,
+}
+
+fn default_agent_command() -> Vec<String> {
+    vec!["claude".to_string()]
 }
 
 fn default_budget_usd() -> f64 {
@@ -98,6 +105,7 @@ pub async fn create_or_recover(def: &config::AgentDef) -> Result<AgentState> {
         max_turns: def.max_turns,
         unix_user: def.unix_user.clone(),
         budget_usd: def.budget_usd,
+        command: def.command.clone(),
     };
     create(&cfg).await
 }
@@ -198,20 +206,25 @@ pub async fn send(name: &str, message: &str, max_turns: Option<u32>) -> Result<S
     Ok(response_text)
 }
 
-/// Build the tokio Command for running claude, respecting unix_user if set.
-fn build_command(cfg: &AgentConfig, args: &[String]) -> Command {
+/// Build the tokio Command for running the agent process.
+/// Uses cfg.command as the executable (defaults to ["claude"]).
+/// When unix_user is set, wraps with sudo and strips SSH env vars.
+pub fn build_command(cfg: &AgentConfig, args: &[String]) -> Command {
+    let (bin, prefix_args) = split_command(&cfg.command);
     let mut cmd = match &cfg.unix_user {
         Some(user) => {
             let mut c = Command::new("sudo");
-            c.args(["-u", user, "-H", "--", "claude"]);
+            c.args(["-u", user, "-H", "--"]);
+            c.arg(bin);
+            c.args(prefix_args);
             c.args(args);
-            // Strip SSH agent socket so the child cannot inherit the parent's keys.
             c.env_remove("SSH_AUTH_SOCK");
             c.env_remove("SSH_AGENT_PID");
             c
         }
         None => {
-            let mut c = Command::new("claude");
+            let mut c = Command::new(bin);
+            c.args(prefix_args);
             c.args(args);
             c
         }
@@ -220,6 +233,16 @@ fn build_command(cfg: &AgentConfig, args: &[String]) -> Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd
+}
+
+/// Split a command vec into (binary, prefix_args).
+/// Falls back to "claude" if the vec is empty.
+fn split_command(command: &[String]) -> (&str, &[String]) {
+    match command {
+        [] => ("claude", &[]),
+        [bin] => (bin.as_str(), &[]),
+        [bin, rest @ ..] => (bin.as_str(), rest),
+    }
 }
 
 /// List all agents whose state files exist on disk.
@@ -317,6 +340,7 @@ created_at: "2026-01-01T00:00:00Z"
             max_turns: 100,
             unix_user: Some("agent1".to_string()),
             budget_usd: 10.0,
+            command: vec!["claude".to_string()],
         };
         let state = AgentState {
             config: cfg,
@@ -331,5 +355,51 @@ created_at: "2026-01-01T00:00:00Z"
         assert_eq!(restored.config.unix_user.as_deref(), Some("agent1"));
         assert_eq!(restored.session_id, "sid-123");
         assert_eq!(restored.total_cost, 0.42);
+        assert_eq!(restored.config.command, vec!["claude"]);
+    }
+
+    #[test]
+    fn test_split_command_default() {
+        let (bin, args) = split_command(&["claude".to_string()]);
+        assert_eq!(bin, "claude");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_split_command_with_prefix_args() {
+        let cmd = vec!["my-agent".to_string(), "--mode".to_string(), "chat".to_string()];
+        let (bin, args) = split_command(&cmd);
+        assert_eq!(bin, "my-agent");
+        assert_eq!(args, &["--mode", "chat"]);
+    }
+
+    #[test]
+    fn test_split_command_empty_falls_back() {
+        let (bin, args) = split_command(&[]);
+        assert_eq!(bin, "claude");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_agent_config_custom_command_serde() {
+        let yaml = r#"
+config:
+  name: mybot
+  model: claude-opus-4-6
+  system_prompt: ""
+  work_dir: /tmp
+  max_turns: 100
+  command:
+    - my-agent-wrapper
+    - --protocol
+    - stream-json
+pid: 0
+session_id: ""
+total_turns: 0
+total_cost: 0.0
+created_at: "2026-01-01T00:00:00Z"
+"#;
+        let state: AgentState = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(state.config.command, vec!["my-agent-wrapper", "--protocol", "stream-json"]);
     }
 }

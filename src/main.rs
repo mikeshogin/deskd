@@ -53,12 +53,16 @@ enum AgentAction {
         /// Max turns per task.
         #[arg(long, default_value = "100")]
         max_turns: u32,
-        /// Linux user to run claude as (optional).
+        /// Linux user to run the agent process as (optional).
         #[arg(long)]
         unix_user: Option<String>,
         /// Budget cap in USD.
         #[arg(long, default_value = "50.0")]
         budget_usd: f64,
+        /// Command to run as the agent process (default: claude).
+        /// Pass multiple times for command + fixed args: --command my-agent --command --flag
+        #[arg(long = "command")]
+        command: Vec<String>,
     },
     /// Send a task to an agent (via bus if running, direct otherwise).
     Send {
@@ -119,7 +123,13 @@ async fn main() -> anyhow::Result<()> {
                 max_turns,
                 unix_user,
                 budget_usd,
+                command,
             } => {
+                let resolved_command = if command.is_empty() {
+                    vec!["claude".to_string()]
+                } else {
+                    command
+                };
                 let cfg = agent::AgentConfig {
                     name: name.clone(),
                     model,
@@ -128,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
                     max_turns,
                     unix_user,
                     budget_usd,
+                    command: resolved_command,
                 };
                 let state = agent::create(&cfg).await?;
                 println!("Agent {} created", state.config.name);

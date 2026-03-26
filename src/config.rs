@@ -72,13 +72,23 @@ pub struct AgentDef {
     #[serde(default)]
     pub system_prompt: String,
     pub work_dir: String,
-    /// Optional Linux user to run the claude process as.
+    /// Optional Linux user to run the agent process as.
     pub unix_user: Option<String>,
     #[serde(default = "default_max_turns")]
     pub max_turns: u32,
     /// Budget cap in USD. Worker rejects tasks when this is exceeded.
     #[serde(default = "default_budget_usd")]
     pub budget_usd: f64,
+    /// Command to run as the agent process.
+    /// First element is the binary; remaining elements are prepended args.
+    /// Defaults to ["claude"].
+    /// Example: ["my-agent-wrapper", "--mode", "chat"]
+    #[serde(default = "default_command")]
+    pub command: Vec<String>,
+}
+
+fn default_command() -> Vec<String> {
+    vec!["claude".to_string()]
 }
 
 impl WorkspaceConfig {
