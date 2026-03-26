@@ -1,8 +1,10 @@
+mod adapters;
 mod agent;
 mod bus;
 mod config;
 mod mcp;
 mod message;
+mod schedule;
 mod worker;
 
 use clap::{Parser, Subcommand};
@@ -276,13 +278,25 @@ async fn serve(config_path: String) -> anyhow::Result<()> {
         info!(agent = %name, bus = %bus_socket, "started agent bus");
 
         // Start Telegram adapter if configured.
-        // Publishes telegram.in:<chat_id>, subscribes telegram.out:*.
-        // TODO: activate after feat/telegram-adapter is merged.
-        if let Some(ref _tg) = def.telegram {
-            info!(
-                agent = %name,
-                "telegram adapter configured — activation pending merge of feat/telegram-adapter"
-            );
+        // Publishes telegram.in:<chat_id> for incoming messages.
+        // Subscribes to telegram.out:* for outgoing replies.
+        if let Some(ref tg) = def.telegram {
+            let token = tg.token.clone();
+            let bus = bus_socket.clone();
+            let agent_name = name.clone();
+            tokio::spawn(async move {
+                if let Err(e) = adapters::telegram::run(token, bus, agent_name.clone()).await {
+                    tracing::error!(agent = %agent_name, error = %e, "telegram adapter failed");
+                }
+            });
+        }
+
+        // Start schedule tasks if the user config has schedules.
+        if let Some(ref ucfg) = user_cfg {
+            if !ucfg.schedules.is_empty() {
+                schedule::start(ucfg.schedules.clone(), bus_socket.clone(), name.clone());
+                info!(agent = %name, count = ucfg.schedules.len(), "started schedules");
+            }
         }
 
         // Start worker on the agent's bus.

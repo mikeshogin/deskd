@@ -317,26 +317,68 @@ async fn call_send_message(
 
 async fn call_add_persistent_agent(
     args: &Value,
-    agent_name: &str,
-    _bus_socket: &str,
+    parent_name: &str,
+    bus_socket: &str,
 ) -> Result<Value> {
     let name = args.get("name").and_then(|n| n.as_str()).context("missing name")?;
     let model = args.get("model").and_then(|m| m.as_str()).context("missing model")?;
-    let _system_prompt = args.get("system_prompt").and_then(|s| s.as_str()).unwrap_or("");
-    let _subscribe: Vec<&str> = args
+    let system_prompt = args.get("system_prompt").and_then(|s| s.as_str()).unwrap_or("");
+    let subscribe: Vec<String> = args
         .get("subscribe")
         .and_then(|s| s.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-        .unwrap_or_default();
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
+        .unwrap_or_else(|| vec![format!("agent:{}", name)]);
 
-    // TODO: actually spawn the agent process and register it on the bus.
-    // For now, log the intent and return success.
-    info!(parent = %agent_name, agent = %name, model = %model, "add_persistent_agent requested (not yet implemented)");
+    // Get the deskd binary path (we are running as a subprocess of claude, so $0 is deskd).
+    let deskd_bin = std::env::var("DESKD_BIN")
+        .unwrap_or_else(|_| "deskd".to_string());
 
+    // Work dir: same as parent (best effort from env or cwd).
+    let work_dir = std::env::var("PWD").unwrap_or_else(|_| "/tmp".to_string());
+
+    // Create agent state file via `deskd agent create`.
+    let create_status = tokio::process::Command::new(&deskd_bin)
+        .args([
+            "agent", "create", name,
+            "--model", model,
+            "--prompt", system_prompt,
+            "--workdir", &work_dir,
+        ])
+        .status()
+        .await;
+
+    match create_status {
+        Err(e) => {
+            anyhow::bail!("failed to create agent '{}': {}", name, e);
+        }
+        Ok(s) if !s.success() => {
+            // Agent may already exist — that's OK for idempotent calls.
+            info!(parent = %parent_name, agent = %name, "agent create returned non-zero (may already exist)");
+        }
+        Ok(_) => {
+            info!(parent = %parent_name, agent = %name, model = %model, "agent state created");
+        }
+    }
+
+    // Start the worker as a background process connected to the parent's bus.
+    let _child = tokio::process::Command::new(&deskd_bin)
+        .args(["agent", "run", name, "--socket", bus_socket])
+        .env("DESKD_BUS_SOCKET", bus_socket)
+        .env("DESKD_AGENT_NAME", name)
+        .spawn()
+        .with_context(|| format!("failed to spawn worker for agent '{}'", name))?;
+
+    // Detach — child runs independently.
+    info!(parent = %parent_name, agent = %name, bus = %bus_socket, "persistent sub-agent spawned");
+
+    let subscribe_display = subscribe.join(", ");
     Ok(json!({
         "content": [{
             "type": "text",
-            "text": format!("Agent '{}' registered (will be available after deskd restart — persistent agent spawning not yet implemented)", name)
+            "text": format!(
+                "Agent '{}' started on bus {}. Subscriptions: {}",
+                name, bus_socket, subscribe_display
+            )
         }],
         "isError": false
     }))

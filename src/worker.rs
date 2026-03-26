@@ -37,9 +37,14 @@ pub async fn run(name: &str, socket_path: &str, bus_socket: Option<String>) -> R
     let initial_state = agent::load_state(name)?;
     let budget_usd = initial_state.config.budget_usd;
 
+    // Default subscriptions. Workers receive:
+    //   agent:<name>     — direct messages (from MCP send_message, other agents, CLI)
+    //   queue:tasks      — shared task queue
+    //   telegram.in:*    — messages arriving from Telegram adapter
     let subscriptions = vec![
         format!("agent:{}", name),
         "queue:tasks".to_string(),
+        "telegram.in:*".to_string(),
     ];
 
     let stream = bus_connect(socket_path, name, subscriptions).await?;

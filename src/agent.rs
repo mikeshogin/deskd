@@ -157,9 +157,9 @@ pub async fn send(name: &str, message: &str, max_turns: Option<u32>, bus_socket:
 
     let turns = max_turns.unwrap_or(state.config.max_turns);
 
+    // Build args with -p <message> last so messages starting with '-' are not
+    // misinterpreted as flags by the claude CLI.
     let mut args = vec![
-        "-p".to_string(),
-        message.to_string(),
         "--output-format".to_string(),
         "stream-json".to_string(),
         "--verbose".to_string(),
@@ -184,6 +184,10 @@ pub async fn send(name: &str, message: &str, max_turns: Option<u32>, bus_socket:
     // deskd must be in PATH for the unix user running claude.
     args.push("--mcp-server".to_string());
     args.push(format!("deskd mcp --agent {}", name));
+
+    // -p <message> goes last so leading dashes in message are not parsed as flags.
+    args.push("-p".to_string());
+    args.push(message.to_string());
 
     debug!(agent = %name, turns, "spawning claude");
 
