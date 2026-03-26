@@ -48,9 +48,14 @@ jobs:
 
       - name: Install musl tools (Linux)
         if: contains(matrix.target, 'linux')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools perl
 
-      - name: Build
+      - name: Build (Linux musl)
+        if: contains(matrix.target, 'musl')
+        run: cargo build --release --target ${{ matrix.target }} --features vendored-openssl
+
+      - name: Build (macOS)
+        if: contains(matrix.target, 'apple')
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package
