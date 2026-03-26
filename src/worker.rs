@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::agent;
@@ -25,19 +26,25 @@ pub async fn bus_connect(
     line.push('\n');
     stream.write_all(line.as_bytes()).await?;
 
-    eprintln!("[worker] registered as {} on bus", name);
+    info!(agent = %name, "registered on bus");
     Ok(stream)
 }
 
 /// Run the agent worker loop: read messages from bus, execute tasks, post results.
-pub async fn run(name: &str, socket_path: &str) -> Result<()> {
-    agent::load_state(name)?; // verify agent exists
-    let max_cost = 50.0_f64; // budget cap in USD
+/// `bus_socket`: the agent's bus socket path, injected as DESKD_BUS_SOCKET into
+/// the claude subprocess so the MCP server can connect to the bus.
+pub async fn run(name: &str, socket_path: &str, bus_socket: Option<String>) -> Result<()> {
+    let initial_state = agent::load_state(name)?;
+    let budget_usd = initial_state.config.budget_usd;
 
-    // Subscribe to agent-specific target and the default task queue
+    // Default subscriptions. Workers receive:
+    //   agent:<name>     — direct messages (from MCP send_message, other agents, CLI)
+    //   queue:tasks      — shared task queue
+    //   telegram.in:*    — messages arriving from Telegram adapter
     let subscriptions = vec![
         format!("agent:{}", name),
         "queue:tasks".to_string(),
+        "telegram.in:*".to_string(),
     ];
 
     let stream = bus_connect(socket_path, name, subscriptions).await?;
@@ -45,7 +52,7 @@ pub async fn run(name: &str, socket_path: &str) -> Result<()> {
     let mut lines = BufReader::new(reader).lines();
     let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
 
-    eprintln!("[worker] {} waiting for tasks", name);
+    info!(agent = %name, "waiting for tasks");
 
     while let Some(line) = lines.next_line().await? {
         if line.is_empty() {
@@ -55,15 +62,20 @@ pub async fn run(name: &str, socket_path: &str) -> Result<()> {
         let msg: Message = match serde_json::from_str(&line) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("[worker] invalid message: {}", e);
+                warn!(agent = %name, error = %e, "invalid message from bus");
                 continue;
             }
         };
 
-        // Check budget
+        // Check budget against the configured cap.
         let current_state = agent::load_state(name)?;
-        if current_state.total_cost >= max_cost {
-            eprintln!("[worker] budget exceeded (${:.2} >= ${:.2}), rejecting task", current_state.total_cost, max_cost);
+        if current_state.total_cost >= budget_usd {
+            warn!(
+                agent = %name,
+                cost = current_state.total_cost,
+                budget = budget_usd,
+                "budget exceeded, rejecting task"
+            );
             continue;
         }
 
@@ -72,25 +84,21 @@ pub async fn run(name: &str, socket_path: &str) -> Result<()> {
             .unwrap_or_default();
 
         if task.is_empty() {
-            eprintln!("[worker] message has no task payload, skipping");
+            debug!(agent = %name, "message has no task payload, skipping");
             continue;
         }
 
-        eprintln!("[worker] processing task from {}: {}", msg.source, truncate(task, 80));
+        info!(agent = %name, source = %msg.source, task = %truncate(task, 80), "processing task");
 
-        // Run claude via existing send() logic
         let max_turns = msg.payload.get("max_turns")
             .and_then(|t| t.as_u64())
             .map(|t| t as u32);
 
-        match agent::send(name, task, max_turns).await {
+        match agent::send(name, task, max_turns, bus_socket.as_deref()).await {
             Ok(response) => {
-                eprintln!("[worker] task completed, posting result");
+                info!(agent = %name, "task completed, posting result");
 
-                // Determine reply target
-                let target = msg.reply_to
-                    .as_deref()
-                    .unwrap_or(&msg.source);
+                let target = msg.reply_to.as_deref().unwrap_or(&msg.source);
 
                 let reply = Message {
                     id: Uuid::new_v4().to_string(),
@@ -104,22 +112,29 @@ pub async fn run(name: &str, socket_path: &str) -> Result<()> {
                     metadata: Metadata::default(),
                 };
 
-                let envelope = serde_json::json!({"type": "message", "id": reply.id, "source": reply.source, "target": reply.target, "payload": reply.payload, "metadata": reply.metadata});
+                let envelope = serde_json::json!({
+                    "type": "message",
+                    "id": reply.id,
+                    "source": reply.source,
+                    "target": reply.target,
+                    "payload": reply.payload,
+                    "metadata": reply.metadata,
+                });
                 let mut reply_line = serde_json::to_string(&envelope)?;
                 reply_line.push('\n');
 
                 let mut w = writer.lock().await;
-                match w.write_all(reply_line.as_bytes()).await {
-                    Ok(_) => eprintln!("[worker] reply sent to bus: target={}", target),
-                    Err(e) => eprintln!("[worker] failed to write reply to bus: {}", e),
+                if let Err(e) = w.write_all(reply_line.as_bytes()).await {
+                    warn!(agent = %name, error = %e, target = %target, "failed to write reply to bus");
+                } else {
+                    debug!(agent = %name, target = %target, "reply sent to bus");
                 }
             }
             Err(e) => {
-                eprintln!("[worker] task failed: {}", e);
+                warn!(agent = %name, error = %e, "task failed");
 
-                // Post error back if there's a reply target
                 if let Some(reply_to) = &msg.reply_to {
-                    let reply = serde_json::json!({
+                    let error_msg = serde_json::json!({
                         "type": "message",
                         "id": Uuid::new_v4().to_string(),
                         "source": name,
@@ -127,33 +142,39 @@ pub async fn run(name: &str, socket_path: &str) -> Result<()> {
                         "payload": {"error": format!("{}", e), "in_reply_to": &msg.id},
                         "metadata": {"priority": 5u8},
                     });
-                    let mut reply_line = serde_json::to_string(&reply)?;
-                    reply_line.push('\n');
+                    let mut err_line = serde_json::to_string(&error_msg)?;
+                    err_line.push('\n');
 
                     let mut w = writer.lock().await;
-                    w.write_all(reply_line.as_bytes()).await.ok();
+                    if let Err(write_err) = w.write_all(err_line.as_bytes()).await {
+                        warn!(agent = %name, error = %write_err, "failed to write error reply to bus");
+                    }
                 }
             }
         }
     }
 
-    eprintln!("[worker] disconnected from bus");
+    info!(agent = %name, "disconnected from bus");
     Ok(())
 }
 
-/// Send a message via the bus (connect, send, disconnect).
-pub async fn send_via_bus(socket_path: &str, source: &str, target: &str, task: &str, max_turns: Option<u32>) -> Result<()> {
+/// Send a message via the bus (connect, send, wait for one reply, disconnect).
+pub async fn send_via_bus(
+    socket_path: &str,
+    source: &str,
+    target: &str,
+    task: &str,
+    max_turns: Option<u32>,
+) -> Result<()> {
     let mut stream = UnixStream::connect(socket_path)
         .await
         .with_context(|| format!("Failed to connect to bus at {}", socket_path))?;
 
-    // Register as a transient client
     let reg = serde_json::json!({"type": "register", "name": source, "subscriptions": []});
     let mut line = serde_json::to_string(&reg)?;
     line.push('\n');
     stream.write_all(line.as_bytes()).await?;
 
-    // Send the task message
     let mut payload = serde_json::json!({"task": task});
     if let Some(turns) = max_turns {
         payload["max_turns"] = serde_json::json!(turns);
@@ -172,9 +193,8 @@ pub async fn send_via_bus(socket_path: &str, source: &str, target: &str, task: &
     msg_line.push('\n');
     stream.write_all(msg_line.as_bytes()).await?;
 
-    eprintln!("[send] task posted to {} via bus", target);
+    debug!(source = %source, target = %target, "task posted to bus");
 
-    // Read response (blocking wait for one message back)
     let (reader, _) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     if let Some(response_line) = lines.next_line().await? {
@@ -195,7 +215,6 @@ fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
     }
-    // Find the last char boundary at or before max
     let mut end = max;
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
