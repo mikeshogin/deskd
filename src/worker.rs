@@ -203,16 +203,57 @@ pub async fn run(
                 }
             });
 
+            // Create injection channel for mid-task message forwarding.
+            let (inject_tx, inject_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
             let image = image_base64.as_deref().zip(image_media_type.as_deref());
-            let result = agent::send_streaming(
+
+            // Pin the task future so we can poll it in select!
+            let mut task_fut = Box::pin(agent::send_streaming(
                 name,
                 task,
                 max_turns,
                 bus_socket.as_deref(),
                 progress_tx,
                 image,
-            )
-            .await;
+                Some(inject_rx),
+            ));
+
+            // Concurrently await task completion OR new bus messages for injection.
+            let result = loop {
+                tokio::select! {
+                    task_result = &mut task_fut => {
+                        break task_result;
+                    }
+                    Ok(Some(bus_line)) = lines.next_line() => {
+                        if bus_line.is_empty() {
+                            continue;
+                        }
+                        if let Ok(inject_msg) = serde_json::from_str::<Message>(&bus_line) {
+                            let inject_task = inject_msg
+                                .payload
+                                .get("task")
+                                .and_then(|t| t.as_str())
+                                .unwrap_or_default();
+                            if !inject_task.is_empty() {
+                                info!(
+                                    agent = %name,
+                                    source = %inject_msg.source,
+                                    task = %truncate(inject_task, 80),
+                                    "injecting mid-task message"
+                                );
+                                let _ = inject_tx.send(inject_task.to_string());
+                            }
+                        } else {
+                            warn!(agent = %name, "invalid message from bus during task, skipping");
+                        }
+                    }
+                }
+            };
+            // Dropping inject_tx here signals the inject forwarder in agent.rs to exit,
+            // which will eventually close Claude's stdin when all senders are gone.
+            drop(inject_tx);
+
             fwd_task.await.ok();
 
             // Signal typing stop
