@@ -231,6 +231,7 @@ async fn main() -> anyhow::Result<()> {
                         command
                     },
                     config_path: None,
+                    container: None,
                 };
                 let state = agent::create(&cfg).await?;
                 println!("Agent {} created", state.config.name);
@@ -1036,6 +1037,7 @@ async fn serve(config_path: String) -> anyhow::Result<()> {
                         mcp_json,
                     ],
                     config_path: Some(cfg_path.clone()),
+                    container: def.container.clone(),
                 };
                 agent::create_or_update_from_config(&sub_cfg).await?;
 

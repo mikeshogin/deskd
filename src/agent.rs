@@ -7,7 +7,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
-use crate::config::{self, UserConfig};
+use crate::config::{self, ContainerConfig, UserConfig};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -28,6 +28,9 @@ pub struct AgentConfig {
     /// Path to the agent's deskd.yaml (injected as DESKD_AGENT_CONFIG into claude).
     #[serde(default)]
     pub config_path: Option<String>,
+    /// Container config. When set, the agent runs inside a container.
+    #[serde(default)]
+    pub container: Option<ContainerConfig>,
 }
 
 fn default_budget_usd() -> f64 {
@@ -163,6 +166,7 @@ pub async fn create_or_recover(
         budget_usd: def.budget_usd,
         command: def.command.clone(),
         config_path: Some(def.config_path()),
+        container: def.container.clone(),
     };
 
     let path = state_path(&def.name);
@@ -457,6 +461,10 @@ async fn send_inner(
 /// When unix_user is set, wraps with sudo and strips SSH env vars.
 /// extra_env: additional environment variables to pass to the process.
 pub fn build_command(cfg: &AgentConfig, args: &[String], extra_env: &[(&str, &str)]) -> Command {
+    if let Some(ref container) = cfg.container {
+        return build_container_command(cfg, container, args, extra_env);
+    }
+
     let (bin, prefix) = split_command(&cfg.command);
     let mut cmd = match &cfg.unix_user {
         Some(user) => {
@@ -483,6 +491,118 @@ pub fn build_command(cfg: &AgentConfig, args: &[String], extra_env: &[(&str, &st
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd
+}
+
+/// Build a command that runs the agent process inside a container.
+///
+/// Constructs: `<runtime> run --rm -i --name deskd-<agent>
+///   -v <work_dir>:<work_dir> -w <work_dir>
+///   -v <bus_socket_dir>:<bus_socket_dir>
+///   [-v <mount>...] [-v <volume>...] [-e <key>=<val>...]
+///   <image> <command> <args>`
+fn build_container_command(
+    cfg: &AgentConfig,
+    container: &ContainerConfig,
+    args: &[String],
+    extra_env: &[(&str, &str)],
+) -> Command {
+    let runtime = &container.runtime;
+    let mut cmd = Command::new(runtime);
+
+    cmd.args(["run", "--rm", "-i"]);
+    cmd.args(["--name", &format!("deskd-{}", cfg.name)]);
+
+    // Mount the agent's work_dir so the process can access the repo.
+    cmd.args(["-v", &format!("{}:{}", cfg.work_dir, cfg.work_dir)]);
+    cmd.args(["-w", &cfg.work_dir]);
+
+    // The bus socket is at {work_dir}/.deskd/bus.sock — already covered by work_dir mount.
+
+    // User-defined mounts from container config.
+    for mount in &container.mounts {
+        let expanded = expand_tilde(mount);
+        cmd.args(["-v", &expanded]);
+    }
+
+    // Docker volumes.
+    for vol in &container.volumes {
+        cmd.args(["-v", vol]);
+    }
+
+    // Environment variables from container config.
+    for (k, v) in &container.env {
+        cmd.args(["-e", &format!("{}={}", k, v)]);
+    }
+
+    // Extra env vars (DESKD_BUS_SOCKET, DESKD_AGENT_NAME, DESKD_AGENT_CONFIG).
+    for (k, v) in extra_env {
+        cmd.args(["-e", &format!("{}={}", k, v)]);
+    }
+
+    // If there's a config_path, mount it into the container.
+    if let Some(ref config_path) = cfg.config_path {
+        let cp = PathBuf::from(config_path);
+        if let Some(parent) = cp.parent() {
+            let parent_str = parent.to_string_lossy();
+            // Only mount if not already under work_dir.
+            if !parent_str.starts_with(&cfg.work_dir) {
+                cmd.args(["-v", &format!("{}:{}", parent_str, parent_str)]);
+            }
+        }
+    }
+
+    // Image.
+    cmd.arg(&container.image);
+
+    // The actual command to run inside the container.
+    let (bin, prefix) = split_command(&cfg.command);
+    cmd.arg(bin);
+    cmd.args(prefix);
+    cmd.args(args);
+
+    // Don't set current_dir on the host — the container uses -w.
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
+
+/// Expand ~ to $HOME in mount paths.
+/// Handles formats: "~/foo", "~/foo:ro", "~/foo:~/bar", "~/foo:~/bar:ro".
+fn expand_tilde(path: &str) -> String {
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return path.to_string(),
+    };
+
+    // Split into parts, handling the colon-separated mount syntax.
+    // Possible formats: "src", "src:ro", "src:dst", "src:dst:ro"
+    let parts: Vec<&str> = path.splitn(3, ':').collect();
+    let expand = |s: &str| -> String {
+        if s.starts_with("~/") || s == "~" {
+            s.replacen('~', &home, 1)
+        } else {
+            s.to_string()
+        }
+    };
+
+    match parts.len() {
+        1 => expand(parts[0]),
+        2 => {
+            // Could be "src:ro" or "src:dst"
+            let a = expand(parts[0]);
+            let b_raw = parts[1];
+            if b_raw == "ro" || b_raw == "rw" {
+                format!("{}:{}", a, b_raw)
+            } else {
+                format!("{}:{}", a, expand(b_raw))
+            }
+        }
+        3 => {
+            format!("{}:{}:{}", expand(parts[0]), expand(parts[1]), parts[2])
+        }
+        _ => path.to_string(),
+    }
 }
 
 fn split_command(command: &[String]) -> (&str, &[String]) {
@@ -516,6 +636,7 @@ pub async fn spawn_ephemeral(
         budget_usd: 50.0,
         command: default_agent_command(),
         config_path: None,
+        container: None,
     };
 
     create(&cfg).await?;
@@ -603,6 +724,7 @@ created_at: "2024-01-01T00:00:00Z"
             budget_usd: 10.0,
             command: vec!["claude".to_string()],
             config_path: Some("/home/agent1/deskd.yaml".to_string()),
+            container: None,
         };
         let state = AgentState {
             config: cfg,
@@ -635,5 +757,118 @@ created_at: "2024-01-01T00:00:00Z"
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "hello world");
+    }
+
+    #[test]
+    fn test_expand_tilde_simple() {
+        let result = expand_tilde("/absolute/path");
+        assert_eq!(result, "/absolute/path");
+    }
+
+    #[test]
+    fn test_expand_tilde_home() {
+        let home = std::env::var("HOME").unwrap();
+        let result = expand_tilde("~/.ssh");
+        assert_eq!(result, format!("{}/.ssh", home));
+    }
+
+    #[test]
+    fn test_expand_tilde_with_ro() {
+        let home = std::env::var("HOME").unwrap();
+        let result = expand_tilde("~/.ssh:ro");
+        assert_eq!(result, format!("{}/.ssh:ro", home));
+    }
+
+    #[test]
+    fn test_expand_tilde_src_dst() {
+        let home = std::env::var("HOME").unwrap();
+        let result = expand_tilde("~/.gitconfig:~/.gitconfig:ro");
+        assert_eq!(
+            result,
+            format!("{}/.gitconfig:{}/.gitconfig:ro", home, home)
+        );
+    }
+
+    #[test]
+    fn test_build_container_command() {
+        use std::collections::HashMap;
+        let mut env = HashMap::new();
+        env.insert("GH_TOKEN".to_string(), "test-token".to_string());
+
+        let container = ContainerConfig {
+            image: "claude-code-local:official".to_string(),
+            mounts: vec!["/host/path:/container/path:ro".to_string()],
+            volumes: vec!["my-vol:/data".to_string()],
+            env,
+            runtime: "docker".to_string(),
+        };
+
+        let cfg = AgentConfig {
+            name: "test-agent".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
+            system_prompt: String::new(),
+            work_dir: "/home/test".to_string(),
+            max_turns: 100,
+            unix_user: None,
+            budget_usd: 50.0,
+            command: vec![
+                "claude".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+            ],
+            config_path: Some("/home/test/deskd.yaml".to_string()),
+            container: Some(container),
+        };
+
+        let extra_env = [("DESKD_BUS_SOCKET", "/home/test/.deskd/bus.sock")];
+        let args = vec!["--resume".to_string(), "session-1".to_string()];
+
+        let cmd = build_command(&cfg, &args, &extra_env);
+        let program = cmd.as_std().get_program().to_string_lossy().to_string();
+        assert_eq!(program, "docker");
+
+        let cmd_args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+
+        // Verify basic structure.
+        assert!(cmd_args.contains(&"run".to_string()));
+        assert!(cmd_args.contains(&"--rm".to_string()));
+        assert!(cmd_args.contains(&"-i".to_string()));
+        assert!(cmd_args.contains(&"deskd-test-agent".to_string()));
+        assert!(cmd_args.contains(&"/home/test:/home/test".to_string()));
+        assert!(cmd_args.contains(&"/home/test".to_string()));
+        assert!(cmd_args.contains(&"claude-code-local:official".to_string()));
+        assert!(cmd_args.contains(&"/host/path:/container/path:ro".to_string()));
+        assert!(cmd_args.contains(&"my-vol:/data".to_string()));
+        assert!(cmd_args.contains(&"GH_TOKEN=test-token".to_string()));
+        assert!(cmd_args.contains(&"DESKD_BUS_SOCKET=/home/test/.deskd/bus.sock".to_string()));
+        // The agent command + args should be at the end.
+        assert!(cmd_args.contains(&"claude".to_string()));
+        assert!(cmd_args.contains(&"--output-format".to_string()));
+        assert!(cmd_args.contains(&"stream-json".to_string()));
+        assert!(cmd_args.contains(&"--resume".to_string()));
+        assert!(cmd_args.contains(&"session-1".to_string()));
+    }
+
+    #[test]
+    fn test_build_command_no_container() {
+        let cfg = AgentConfig {
+            name: "test".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
+            system_prompt: String::new(),
+            work_dir: "/tmp".to_string(),
+            max_turns: 100,
+            unix_user: None,
+            budget_usd: 50.0,
+            command: vec!["claude".to_string()],
+            config_path: None,
+            container: None,
+        };
+        let cmd = build_command(&cfg, &[], &[]);
+        let program = cmd.as_std().get_program().to_string_lossy().to_string();
+        assert_eq!(program, "claude");
     }
 }

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Where agent state files are stored (relative to $HOME).
@@ -76,6 +77,30 @@ pub struct DiscordRoute {
     pub name: Option<String>,
 }
 
+/// Container runtime config for an agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerConfig {
+    /// OCI image to use (e.g. "claude-code-local:official").
+    pub image: String,
+    /// Host paths to bind-mount. Format: "host_path" or "host_path:container_path"
+    /// or "host_path:container_path:ro" for read-only.
+    #[serde(default)]
+    pub mounts: Vec<String>,
+    /// Docker volumes. Format: "volume_name:container_path".
+    #[serde(default)]
+    pub volumes: Vec<String>,
+    /// Environment variables to set inside the container.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Container runtime binary. Defaults to "docker".
+    #[serde(default = "default_container_runtime")]
+    pub runtime: String,
+}
+
+fn default_container_runtime() -> String {
+    "docker".to_string()
+}
+
 /// Definition of a top-level agent in workspace.yaml.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentDef {
@@ -101,6 +126,9 @@ pub struct AgentDef {
     /// Budget cap in USD. Worker rejects tasks when exceeded.
     #[serde(default = "default_budget_usd")]
     pub budget_usd: f64,
+    /// Container config. When set, the agent process runs inside a container.
+    #[serde(default)]
+    pub container: Option<ContainerConfig>,
 }
 
 impl AgentDef {
@@ -454,6 +482,7 @@ agents:
             model: None,
             command: vec!["claude".into()],
             budget_usd: 50.0,
+            container: None,
         };
         assert_eq!(def.bus_socket(), "/home/kira/.deskd/bus.sock");
         assert_eq!(def.config_path(), "/home/kira/deskd.yaml");
@@ -471,6 +500,7 @@ agents:
             model: None,
             command: vec!["claude".into()],
             budget_usd: 50.0,
+            container: None,
         };
         assert_eq!(def.config_path(), "/etc/agents/kira.yaml");
     }
@@ -571,5 +601,44 @@ schedules:
         assert!(desc.contains("news:ecosystem"));
         assert!(desc.contains("telegram.out:-1003733725513"));
         assert!(desc.contains("You are agent 'kira'"));
+    }
+
+    #[test]
+    fn test_workspace_config_with_container() {
+        let yaml = r#"
+agents:
+  - name: dev
+    work_dir: /home/dev
+    container:
+      image: claude-code-local:official
+      mounts:
+        - "~/.ssh:ro"
+        - "~/.gitconfig:ro"
+      volumes:
+        - "claude-history:/commandhistory"
+      env:
+        GH_TOKEN: "my-token"
+    command: [claude, --output-format, stream-json]
+"#;
+        let cfg: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent = &cfg.agents[0];
+        assert!(agent.container.is_some());
+        let c = agent.container.as_ref().unwrap();
+        assert_eq!(c.image, "claude-code-local:official");
+        assert_eq!(c.mounts.len(), 2);
+        assert_eq!(c.volumes.len(), 1);
+        assert_eq!(c.env.get("GH_TOKEN").unwrap(), "my-token");
+        assert_eq!(c.runtime, "docker");
+    }
+
+    #[test]
+    fn test_workspace_config_no_container() {
+        let yaml = r#"
+agents:
+  - name: dev
+    work_dir: /home/dev
+"#;
+        let cfg: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.agents[0].container.is_none());
     }
 }
