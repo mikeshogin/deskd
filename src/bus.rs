@@ -351,4 +351,136 @@ mod tests {
 
         assert!(rx.try_recv().is_err());
     }
+
+    #[tokio::test]
+    async fn test_telegram_out_glob_routing() {
+        // telegram.out:* should match telegram.out:-123
+        let mut bus = make_bus();
+        let mut rx_tg = register_client(&mut bus, "telegram-adapter", vec!["telegram.out:*"]);
+        let _rx_other = register_client(&mut bus, "other-client", vec![]);
+
+        let msg = make_msg("agent1", "telegram.out:-123");
+        bus.route(&msg);
+
+        let received = rx_tg.try_recv();
+        assert!(
+            received.is_ok(),
+            "telegram.out:* should match telegram.out:-123"
+        );
+        assert_eq!(received.unwrap().target, "telegram.out:-123");
+    }
+
+    #[tokio::test]
+    async fn test_glob_does_not_cross_match() {
+        // telegram.out:-123 should NOT be delivered to github:* subscriber
+        let mut bus = make_bus();
+        let mut rx_gh = register_client(&mut bus, "github-adapter", vec!["github:*"]);
+        let _rx_sender = register_client(&mut bus, "agent1", vec![]);
+
+        let msg = make_msg("agent1", "telegram.out:-123");
+        bus.route(&msg);
+
+        assert!(
+            rx_gh.try_recv().is_err(),
+            "github:* should not match telegram.out:-123"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_glob_matches_multiple_targets() {
+        // telegram.out:* should match both telegram.out:123 and telegram.out:-456
+        let mut bus = make_bus();
+        let mut rx_tg = register_client(&mut bus, "telegram-adapter", vec!["telegram.out:*"]);
+
+        let msg1 = make_msg("agent1", "telegram.out:123");
+        bus.route(&msg1);
+        let msg2 = make_msg("agent1", "telegram.out:-456");
+        bus.route(&msg2);
+
+        let first = rx_tg.try_recv();
+        assert!(
+            first.is_ok(),
+            "telegram.out:* should match telegram.out:123"
+        );
+        assert_eq!(first.unwrap().target, "telegram.out:123");
+
+        let second = rx_tg.try_recv();
+        assert!(
+            second.is_ok(),
+            "telegram.out:* should match telegram.out:-456"
+        );
+        assert_eq!(second.unwrap().target, "telegram.out:-456");
+    }
+
+    #[tokio::test]
+    async fn test_unknown_target_no_panic() {
+        // Message to a completely unknown target with no clients subscribed
+        let mut bus = make_bus();
+        let _rx = register_client(&mut bus, "alice", vec!["queue:tasks"]);
+
+        // Should not panic — just silently drop
+        let msg = make_msg("alice", "nonexistent:target");
+        bus.route(&msg);
+
+        // Empty bus — still should not panic
+        let empty_bus = make_bus();
+        let msg2 = make_msg("ghost", "agent:nobody");
+        empty_bus.route(&msg2);
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_all_except_sender() {
+        // Verify ALL clients except sender receive broadcast
+        let mut bus = make_bus();
+        let mut rx_a = register_client(&mut bus, "a", vec![]);
+        let mut rx_b = register_client(&mut bus, "b", vec![]);
+        let mut rx_c = register_client(&mut bus, "c", vec![]);
+        let mut rx_sender = register_client(&mut bus, "sender", vec![]);
+
+        let msg = make_msg("sender", "broadcast");
+        bus.route(&msg);
+
+        assert!(rx_a.try_recv().is_ok(), "client a should receive broadcast");
+        assert!(rx_b.try_recv().is_ok(), "client b should receive broadcast");
+        assert!(rx_c.try_recv().is_ok(), "client c should receive broadcast");
+        assert!(
+            rx_sender.try_recv().is_err(),
+            "sender should not receive own broadcast"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_queue_sender_exclusion() {
+        // A client subscribed to a queue should not receive its own messages to that queue
+        let mut bus = make_bus();
+        let mut rx = register_client(&mut bus, "worker", vec!["queue:tasks"]);
+
+        let msg = make_msg("worker", "queue:tasks");
+        bus.route(&msg);
+
+        assert!(
+            rx.try_recv().is_err(),
+            "sender should not receive own queue message"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_agent_direct_to_dev() {
+        // Explicit test: message to agent:dev delivered to client named "dev"
+        let mut bus = make_bus();
+        let mut rx_dev = register_client(&mut bus, "dev", vec![]);
+        let mut rx_other = register_client(&mut bus, "other", vec![]);
+
+        let msg = make_msg("cli", "agent:dev");
+        bus.route(&msg);
+
+        let received = rx_dev.try_recv();
+        assert!(received.is_ok(), "agent:dev should deliver to client 'dev'");
+        assert_eq!(received.unwrap().source, "cli");
+
+        assert!(
+            rx_other.try_recv().is_err(),
+            "other clients should not receive agent:dev message"
+        );
+    }
 }
