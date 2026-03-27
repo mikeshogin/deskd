@@ -107,6 +107,33 @@ pub async fn create(cfg: &AgentConfig) -> Result<AgentState> {
     Ok(state)
 }
 
+/// Create or update agent state from an AgentConfig.
+/// If state already exists, updates the config fields but preserves session/cost/turns.
+/// Used for sub-agents spawned from deskd.yaml.
+pub async fn create_or_update_from_config(cfg: &AgentConfig) -> Result<AgentState> {
+    let path = state_path(&cfg.name);
+    if path.exists() {
+        let mut state = load_state(&cfg.name)?;
+        state.config = cfg.clone();
+        save_state(&state)?;
+        info!(agent = %cfg.name, "sub-agent state updated");
+        return Ok(state);
+    }
+    let state = AgentState {
+        config: cfg.clone(),
+        pid: 0,
+        session_id: String::new(),
+        total_turns: 0,
+        total_cost: 0.0,
+        created_at: Utc::now().to_rfc3339(),
+        status: "idle".to_string(),
+        current_task: String::new(),
+    };
+    save_state(&state)?;
+    info!(agent = %cfg.name, "sub-agent created");
+    Ok(state)
+}
+
 /// Create or recover agent state from workspace AgentDef + optional UserConfig.
 /// If state already exists, returns it with config fields updated from current def.
 /// Model priority: workspace def.model override > user_cfg.model > default.

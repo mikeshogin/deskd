@@ -381,8 +381,19 @@ async fn call_add_persistent_agent(
     }
 
     // Start the worker as a background process connected to the parent's bus.
+    let mut run_args = vec![
+        "agent".to_string(),
+        "run".to_string(),
+        name.to_string(),
+        "--socket".to_string(),
+        bus_socket.to_string(),
+    ];
+    for sub in &subscribe {
+        run_args.push("--subscribe".to_string());
+        run_args.push(sub.clone());
+    }
     let _child = tokio::process::Command::new(&deskd_bin)
-        .args(["agent", "run", name, "--socket", bus_socket])
+        .args(&run_args)
         .env("DESKD_BUS_SOCKET", bus_socket)
         .env("DESKD_AGENT_NAME", name)
         .spawn()

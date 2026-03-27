@@ -83,6 +83,9 @@ enum AgentAction {
         name: String,
         #[arg(long, default_value = DEFAULT_SOCKET)]
         socket: String,
+        /// Custom subscriptions (overrides defaults). Can be repeated.
+        #[arg(long)]
+        subscribe: Vec<String>,
     },
     /// List registered agents with live status.
     List {
@@ -194,11 +197,20 @@ async fn main() -> anyhow::Result<()> {
                     println!("{}", response);
                 }
             }
-            AgentAction::Run { name, socket } => {
+            AgentAction::Run {
+                name,
+                socket,
+                subscribe,
+            } => {
                 agent::load_state(&name)?;
+                let subs = if subscribe.is_empty() {
+                    None
+                } else {
+                    Some(subscribe)
+                };
                 info!(agent = %name, "starting worker");
                 tokio::select! {
-                    result = worker::run(&name, &socket, Some(socket.clone())) => { result?; }
+                    result = worker::run(&name, &socket, Some(socket.clone()), subs) => { result?; }
                     _ = tokio::signal::ctrl_c() => {
                         info!(agent = %name, "shutting down");
                     }
@@ -466,10 +478,62 @@ async fn serve(config_path: String) -> anyhow::Result<()> {
         // Start worker on the agent's bus.
         let bus = bus_socket.clone();
         tokio::spawn(async move {
-            if let Err(e) = worker::run(&name, &bus, Some(bus.clone())).await {
+            if let Err(e) = worker::run(&name, &bus, Some(bus.clone()), None).await {
                 tracing::error!(agent = %name, error = %e, "worker exited with error");
             }
         });
+
+        // Start sub-agent workers defined in the agent's deskd.yaml.
+        if let Some(ref ucfg) = user_cfg {
+            for sub in &ucfg.agents {
+                let mcp_json = serde_json::json!({
+                    "mcpServers": {
+                        "deskd": {
+                            "command": "deskd",
+                            "args": ["mcp", "--agent", &sub.name]
+                        }
+                    }
+                })
+                .to_string();
+
+                let sub_cfg = agent::AgentConfig {
+                    name: sub.name.clone(),
+                    model: sub.model.clone(),
+                    system_prompt: sub.system_prompt.clone(),
+                    work_dir: def.work_dir.clone(),
+                    max_turns: ucfg.max_turns,
+                    unix_user: def.unix_user.clone(),
+                    budget_usd: def.budget_usd,
+                    command: vec![
+                        "claude".into(),
+                        "--output-format".into(),
+                        "stream-json".into(),
+                        "--verbose".into(),
+                        "--dangerously-skip-permissions".into(),
+                        "--model".into(),
+                        sub.model.clone(),
+                        "--max-turns".into(),
+                        ucfg.max_turns.to_string(),
+                        "--mcp-config".into(),
+                        mcp_json,
+                    ],
+                    config_path: Some(cfg_path.clone()),
+                };
+                agent::create_or_update_from_config(&sub_cfg).await?;
+
+                let sub_name = sub.name.clone();
+                let bus = bus_socket.clone();
+                let subs = sub.subscribe.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        worker::run(&sub_name, &bus, Some(bus.clone()), Some(subs)).await
+                    {
+                        tracing::error!(agent = %sub_name, error = %e, "sub-agent worker exited");
+                    }
+                });
+                info!(agent = %def.name, sub_agent = %sub.name, "started sub-agent worker");
+            }
+        }
     }
 
     info!("all agents started — press Ctrl-C to stop");
