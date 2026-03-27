@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::agent;
 use crate::inbox;
-use crate::message::{Message, Metadata};
+use crate::message::Message;
 
 /// Connect to the bus, register, and return the stream.
 pub async fn bus_connect(
@@ -166,15 +166,25 @@ pub async fn run(
             .and_then(|t| t.as_u64())
             .map(|t| t as u32);
 
-        // Detect Telegram messages by reply_to = "telegram.out:<chat_id>"
-        let telegram_chat_id = msg
-            .reply_to
-            .as_deref()
-            .and_then(|s| s.strip_prefix("telegram.out:"))
-            .and_then(|id| id.parse::<i64>().ok());
+        // Determine reply target: workflow engine tasks route back to sm:<id>.
+        let reply_target = if let Some(sm_id) =
+            msg.payload.get("sm_instance_id").and_then(|v| v.as_str())
+        {
+            format!("sm:{}", sm_id)
+        } else {
+            msg.reply_to.as_deref().unwrap_or(&msg.source).to_string()
+        };
+        let is_telegram = reply_target.starts_with("telegram.out:");
+        let telegram_chat_id = if is_telegram {
+            reply_target
+                .strip_prefix("telegram.out:")
+                .and_then(|id| id.parse::<i64>().ok())
+        } else {
+            None
+        };
 
-        if let Some(chat_id) = telegram_chat_id {
-            let reply_target = format!("telegram.out:{}", chat_id);
+        // Telegram-specific: typing indicators + progress message timer.
+        let progress_cancel_tx = if let Some(chat_id) = telegram_chat_id {
             let ctrl_target = format!("telegram.ctrl:{}", chat_id);
 
             // Signal typing start
@@ -199,9 +209,8 @@ pub async fn run(
             let start_time = std::time::Instant::now();
             let progress_writer = writer.clone();
             let progress_name = name.to_string();
-            let progress_ctrl = ctrl_target.clone();
-            let (progress_cancel_tx, mut progress_cancel_rx) =
-                tokio::sync::oneshot::channel::<()>();
+            let progress_ctrl = ctrl_target;
+            let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
 
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -219,102 +228,130 @@ pub async fn run(
                             )
                             .await;
                         }
-                        _ = &mut progress_cancel_rx => break,
+                        _ = &mut cancel_rx => break,
                     }
                 }
             });
 
-            // Stream assistant blocks to Telegram as they arrive
-            let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-            let writer_fwd = writer.clone();
-            let name_owned = name.to_string();
-            let reply_owned = reply_target.clone();
-            let fwd_task = tokio::spawn(async move {
-                while let Some(text) = progress_rx.recv().await {
-                    write_bus_envelope(
-                        &writer_fwd,
-                        &name_owned,
-                        &reply_owned,
-                        serde_json::json!({"result": text}),
-                    )
-                    .await;
+            Some(cancel_tx)
+        } else {
+            None
+        };
+
+        // Unified streaming path: always use send_streaming() for all targets.
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let writer_fwd = writer.clone();
+        let name_owned = name.to_string();
+        let reply_owned = reply_target.clone();
+        let fwd_task = tokio::spawn(async move {
+            let mut full_response = String::new();
+            while let Some(text) = progress_rx.recv().await {
+                full_response.push_str(&text);
+                write_bus_envelope(
+                    &writer_fwd,
+                    &name_owned,
+                    &reply_owned,
+                    serde_json::json!({"result": text}),
+                )
+                .await;
+            }
+            full_response
+        });
+
+        // Create injection channel for mid-task message forwarding.
+        let (inject_tx, inject_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        let image = image_base64.as_deref().zip(image_media_type.as_deref());
+
+        // Pin the task future so we can poll it in select!
+        let mut task_fut = Box::pin(agent::send_streaming(
+            name,
+            task,
+            max_turns,
+            bus_socket.as_deref(),
+            progress_tx,
+            image,
+            Some(inject_rx),
+        ));
+
+        // Concurrently await task completion OR new bus messages for injection.
+        let result = loop {
+            tokio::select! {
+                task_result = &mut task_fut => {
+                    break task_result;
                 }
-            });
-
-            // Create injection channel for mid-task message forwarding.
-            let (inject_tx, inject_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-
-            let image = image_base64.as_deref().zip(image_media_type.as_deref());
-
-            // Pin the task future so we can poll it in select!
-            let mut task_fut = Box::pin(agent::send_streaming(
-                name,
-                task,
-                max_turns,
-                bus_socket.as_deref(),
-                progress_tx,
-                image,
-                Some(inject_rx),
-            ));
-
-            // Concurrently await task completion OR new bus messages for injection.
-            let result = loop {
-                tokio::select! {
-                    task_result = &mut task_fut => {
-                        break task_result;
+                Ok(Some(bus_line)) = lines.next_line() => {
+                    if bus_line.is_empty() {
+                        continue;
                     }
-                    Ok(Some(bus_line)) = lines.next_line() => {
-                        if bus_line.is_empty() {
-                            continue;
+                    if let Ok(inject_msg) = serde_json::from_str::<Message>(&bus_line) {
+                        let inject_task = inject_msg
+                            .payload
+                            .get("task")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or_default();
+                        if !inject_task.is_empty() {
+                            info!(
+                                agent = %name,
+                                source = %inject_msg.source,
+                                task = %truncate(inject_task, 80),
+                                "injecting mid-task message"
+                            );
+                            let _ = inject_tx.send(inject_task.to_string());
                         }
-                        if let Ok(inject_msg) = serde_json::from_str::<Message>(&bus_line) {
-                            let inject_task = inject_msg
-                                .payload
-                                .get("task")
-                                .and_then(|t| t.as_str())
-                                .unwrap_or_default();
-                            if !inject_task.is_empty() {
-                                info!(
-                                    agent = %name,
-                                    source = %inject_msg.source,
-                                    task = %truncate(inject_task, 80),
-                                    "injecting mid-task message"
-                                );
-                                let _ = inject_tx.send(inject_task.to_string());
-                            }
-                        } else {
-                            warn!(agent = %name, "invalid message from bus during task, skipping");
-                        }
+                    } else {
+                        warn!(agent = %name, "invalid message from bus during task, skipping");
                     }
                 }
-            };
-            // Dropping inject_tx here signals the inject forwarder in agent.rs to exit,
-            // which will eventually close Claude's stdin when all senders are gone.
-            drop(inject_tx);
+            }
+        };
+        // Dropping inject_tx signals the inject forwarder in agent.rs to exit.
+        drop(inject_tx);
 
-            fwd_task.await.ok();
+        let full_response = fwd_task.await.unwrap_or_default();
 
-            // Cancel the progress update task and delete the progress message
-            let _ = progress_cancel_tx.send(());
-            write_bus_envelope(
-                &writer,
-                name,
-                &ctrl_target,
-                serde_json::json!({"progress_done": true}),
-            )
-            .await;
+        // Telegram-specific: cancel progress timer, signal typing stop.
+        if let Some(cancel_tx) = progress_cancel_tx {
+            let _ = cancel_tx.send(());
+            if let Some(chat_id) = telegram_chat_id {
+                let ctrl_target = format!("telegram.ctrl:{}", chat_id);
+                write_bus_envelope(
+                    &writer,
+                    name,
+                    &ctrl_target,
+                    serde_json::json!({"progress_done": true}),
+                )
+                .await;
+                write_bus_envelope(
+                    &writer,
+                    name,
+                    &ctrl_target,
+                    serde_json::json!({"typing": false}),
+                )
+                .await;
+            }
+        }
 
-            // Signal typing stop
-            write_bus_envelope(
-                &writer,
-                name,
-                &ctrl_target,
-                serde_json::json!({"typing": false}),
-            )
-            .await;
+        set_idle(name);
+        match result {
+            Ok(_) => {
+                info!(agent = %name, "task completed (streamed)");
 
-            set_idle(name);
-            if let Err(e) = result {
+                // Write to file-based inbox for all senders.
+                if !full_response.is_empty() {
+                    write_inbox(name, &msg, task, Some(full_response), None);
+                }
+
+                // Send final completion marker to reply_to.
+                write_bus_envelope(
+                    &writer,
+                    name,
+                    &reply_target,
+                    serde_json::json!({"final": true, "in_reply_to": msg.id}),
+                )
+                .await;
+            }
+            Err(e) => {
                 warn!(agent = %name, error = %e, "task failed");
                 write_inbox(name, &msg, task, None, Some(format!("{}", e)));
                 write_bus_envelope(
@@ -324,84 +361,6 @@ pub async fn run(
                     serde_json::json!({"error": format!("{}", e), "in_reply_to": msg.id}),
                 )
                 .await;
-            } else {
-                info!(agent = %name, "task completed (streamed to Telegram)");
-            }
-        } else {
-            // Non-Telegram: send full response after completion
-            match agent::send(name, task, max_turns, bus_socket.as_deref()).await {
-                Ok(response) => {
-                    set_idle(name);
-                    info!(agent = %name, "task completed, posting result");
-
-                    // Write to file-based inbox for async reading.
-                    write_inbox(name, &msg, task, Some(response.clone()), None);
-
-                    // If this task was dispatched by the workflow engine, route the
-                    // result back to sm:<instance_id> so the engine processes it.
-                    let target = if let Some(sm_id) =
-                        msg.payload.get("sm_instance_id").and_then(|v| v.as_str())
-                    {
-                        format!("sm:{}", sm_id)
-                    } else {
-                        msg.reply_to.as_deref().unwrap_or(&msg.source).to_string()
-                    };
-
-                    let reply = Message {
-                        id: Uuid::new_v4().to_string(),
-                        source: name.to_string(),
-                        target: target.to_string(),
-                        payload: serde_json::json!({
-                            "result": response,
-                            "in_reply_to": msg.id,
-                        }),
-                        reply_to: None,
-                        metadata: Metadata::default(),
-                    };
-
-                    let envelope = serde_json::json!({
-                        "type": "message",
-                        "id": reply.id,
-                        "source": reply.source,
-                        "target": reply.target,
-                        "payload": reply.payload,
-                        "metadata": reply.metadata,
-                    });
-                    let mut reply_line = serde_json::to_string(&envelope)?;
-                    reply_line.push('\n');
-
-                    let mut w = writer.lock().await;
-                    if let Err(e) = w.write_all(reply_line.as_bytes()).await {
-                        warn!(agent = %name, error = %e, target = %target, "failed to write reply to bus");
-                    } else {
-                        debug!(agent = %name, target = %target, "reply sent to bus");
-                    }
-                }
-                Err(e) => {
-                    set_idle(name);
-                    warn!(agent = %name, error = %e, "task failed");
-
-                    // Write error to inbox.
-                    write_inbox(name, &msg, task, None, Some(format!("{}", e)));
-
-                    if let Some(reply_to) = &msg.reply_to {
-                        let error_msg = serde_json::json!({
-                            "type": "message",
-                            "id": Uuid::new_v4().to_string(),
-                            "source": name,
-                            "target": reply_to,
-                            "payload": {"error": format!("{}", e), "in_reply_to": &msg.id},
-                            "metadata": {"priority": 5u8},
-                        });
-                        let mut err_line = serde_json::to_string(&error_msg)?;
-                        err_line.push('\n');
-
-                        let mut w = writer.lock().await;
-                        if let Err(write_err) = w.write_all(err_line.as_bytes()).await {
-                            warn!(agent = %name, error = %write_err, "failed to write error reply to bus");
-                        }
-                    }
-                }
             }
         }
     }

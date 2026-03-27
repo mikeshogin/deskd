@@ -124,6 +124,9 @@ enum AgentAction {
         /// Remove messages after reading.
         #[arg(long, default_value = "false")]
         clear: bool,
+        /// Keep watching for new messages after printing existing ones.
+        #[arg(long, default_value = "false")]
+        follow: bool,
     },
     /// Show recent completed tasks for an agent (from inbox files).
     Tasks {
@@ -343,31 +346,36 @@ async fn main() -> anyhow::Result<()> {
                 );
                 println!("Created:    {}", s.created_at);
             }
-            AgentAction::Read { name, clear } => {
+            AgentAction::Read {
+                name,
+                clear,
+                follow,
+            } => {
                 let entries = inbox::read(&name)?;
-                if entries.is_empty() {
+                if entries.is_empty() && !follow {
                     println!("No messages for {}", name);
                 } else {
                     let paths: Vec<_> = entries.iter().map(|(p, _)| p.clone()).collect();
                     for (_, entry) in &entries {
-                        println!(
-                            "─── {} → {} [{}] ───",
-                            entry.source,
-                            entry.agent,
-                            &entry.timestamp[..19.min(entry.timestamp.len())]
-                        );
-                        println!("Task: {}", truncate_main(&entry.task, 120));
-                        if let Some(ref result) = entry.result {
-                            println!("{}", result);
-                        }
-                        if let Some(ref error) = entry.error {
-                            println!("ERROR: {}", error);
-                        }
-                        println!();
+                        print_inbox_entry(entry);
                     }
                     if clear {
                         inbox::clear(&paths)?;
                         println!("({} message(s) cleared)", paths.len());
+                    }
+                }
+                if follow {
+                    let mut seen: std::collections::HashSet<std::path::PathBuf> =
+                        inbox::read(&name)?.into_iter().map(|(p, _)| p).collect();
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        let current = inbox::read(&name)?;
+                        for (path, entry) in &current {
+                            if !seen.contains(path) {
+                                seen.insert(path.clone());
+                                print_inbox_entry(entry);
+                            }
+                        }
                     }
                 }
             }
@@ -690,6 +698,23 @@ fn handle_sm(action: SmAction, user_cfg: &config::UserConfig) -> anyhow::Result<
         }
     }
     Ok(())
+}
+
+fn print_inbox_entry(entry: &inbox::InboxEntry) {
+    println!(
+        "─── {} → {} [{}] ───",
+        entry.source,
+        entry.agent,
+        &entry.timestamp[..19.min(entry.timestamp.len())]
+    );
+    println!("Task: {}", truncate_main(&entry.task, 120));
+    if let Some(ref result) = entry.result {
+        println!("{}", result);
+    }
+    if let Some(ref error) = entry.error {
+        println!("ERROR: {}", error);
+    }
+    println!();
 }
 
 fn truncate_main(s: &str, max: usize) -> String {
