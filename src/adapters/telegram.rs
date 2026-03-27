@@ -66,6 +66,9 @@ enum OutboundCmd {
     Text { chat_id: i64, text: String },
     TypingStart(i64),
     TypingStop(i64),
+    ProgressStart(i64),
+    ProgressUpdate { chat_id: i64, text: String },
+    ProgressDone(i64),
 }
 
 /// Run the Telegram adapter for a specific agent.
@@ -232,17 +235,40 @@ async fn bus_loop(
                 }
             };
 
-            let typing = msg
-                .get("payload")
-                .and_then(|p| p.get("typing"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            let payload = msg.get("payload");
 
-            let cmd = if typing {
-                OutboundCmd::TypingStart(chat_id)
+            let cmd = if payload
+                .and_then(|p| p.get("progress_start"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                OutboundCmd::ProgressStart(chat_id)
+            } else if let Some(text) = payload
+                .and_then(|p| p.get("progress_update"))
+                .and_then(|v| v.as_str())
+            {
+                OutboundCmd::ProgressUpdate {
+                    chat_id,
+                    text: text.to_string(),
+                }
+            } else if payload
+                .and_then(|p| p.get("progress_done"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                OutboundCmd::ProgressDone(chat_id)
             } else {
-                OutboundCmd::TypingStop(chat_id)
+                let typing = payload
+                    .and_then(|p| p.get("typing"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if typing {
+                    OutboundCmd::TypingStart(chat_id)
+                } else {
+                    OutboundCmd::TypingStop(chat_id)
+                }
             };
+
             if outbound_tx.send(cmd).is_err() {
                 warn!("telegram adapter: outbound channel closed");
                 break;
@@ -267,9 +293,10 @@ fn spawn_typing(bot: Bot, chat_id: i64) -> tokio::task::JoinHandle<()> {
 }
 
 /// Send messages from the outbound channel to Telegram.
-/// Manages per-chat typing indicators and converts Markdown to HTML.
+/// Manages per-chat typing indicators, progress messages, and converts Markdown to HTML.
 async fn outbound_sender(bot: Bot, mut rx: mpsc::UnboundedReceiver<OutboundCmd>) {
     let mut typing_tasks: HashMap<i64, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut progress_ids: HashMap<i64, teloxide::types::MessageId> = HashMap::new();
 
     while let Some(cmd) = rx.recv().await {
         match cmd {
@@ -309,6 +336,23 @@ async fn outbound_sender(bot: Bot, mut rx: mpsc::UnboundedReceiver<OutboundCmd>)
             OutboundCmd::TypingStop(chat_id) => {
                 if let Some(handle) = typing_tasks.remove(&chat_id) {
                     handle.abort();
+                }
+            }
+            OutboundCmd::ProgressStart(chat_id) => {
+                if let Ok(msg) = bot.send_message(ChatId(chat_id), "⏳ Working...").await {
+                    progress_ids.insert(chat_id, msg.id);
+                }
+            }
+            OutboundCmd::ProgressUpdate { chat_id, text } => {
+                if let Some(&msg_id) = progress_ids.get(&chat_id) {
+                    let _ = bot
+                        .edit_message_text(ChatId(chat_id), msg_id, text)
+                        .await;
+                }
+            }
+            OutboundCmd::ProgressDone(chat_id) => {
+                if let Some(msg_id) = progress_ids.remove(&chat_id) {
+                    let _ = bot.delete_message(ChatId(chat_id), msg_id).await;
                 }
             }
         }

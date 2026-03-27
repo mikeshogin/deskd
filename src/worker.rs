@@ -186,6 +186,45 @@ pub async fn run(
             )
             .await;
 
+            // Send initial progress message
+            write_bus_envelope(
+                &writer,
+                name,
+                &ctrl_target,
+                serde_json::json!({"progress_start": true}),
+            )
+            .await;
+
+            // Spawn a task that edits the progress message every 5 seconds
+            let start_time = std::time::Instant::now();
+            let progress_writer = writer.clone();
+            let progress_name = name.to_string();
+            let progress_ctrl = ctrl_target.clone();
+            let (progress_cancel_tx, mut progress_cancel_rx) =
+                tokio::sync::oneshot::channel::<()>();
+
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(5));
+                interval.tick().await; // skip first immediate tick
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            let elapsed = start_time.elapsed().as_secs();
+                            let text = format!("⏳ Working... {}s", elapsed);
+                            write_bus_envelope(
+                                &progress_writer,
+                                &progress_name,
+                                &progress_ctrl,
+                                serde_json::json!({"progress_update": text}),
+                            )
+                            .await;
+                        }
+                        _ = &mut progress_cancel_rx => break,
+                    }
+                }
+            });
+
             // Stream assistant blocks to Telegram as they arrive
             let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             let writer_fwd = writer.clone();
@@ -255,6 +294,16 @@ pub async fn run(
             drop(inject_tx);
 
             fwd_task.await.ok();
+
+            // Cancel the progress update task and delete the progress message
+            let _ = progress_cancel_tx.send(());
+            write_bus_envelope(
+                &writer,
+                name,
+                &ctrl_target,
+                serde_json::json!({"progress_done": true}),
+            )
+            .await;
 
             // Signal typing stop
             write_bus_envelope(
