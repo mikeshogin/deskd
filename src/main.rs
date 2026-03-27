@@ -8,6 +8,7 @@ mod message;
 mod schedule;
 mod statemachine;
 mod worker;
+mod workflow;
 
 use clap::{Parser, Subcommand};
 use tracing::info;
@@ -1056,6 +1057,21 @@ async fn serve(config_path: String) -> anyhow::Result<()> {
                 });
                 info!(agent = %def.name, sub_agent = %sub.name, "started sub-agent worker");
             }
+        }
+
+        // Start workflow engine if models are defined.
+        if let Some(ref ucfg) = user_cfg
+            && !ucfg.models.is_empty()
+        {
+            let bus = bus_socket.clone();
+            let models = ucfg.models.clone();
+            let agent_name = def.name.clone();
+            tokio::spawn(async move {
+                if let Err(e) = workflow::run(&bus, models).await {
+                    tracing::error!(agent = %agent_name, error = %e, "workflow engine exited");
+                }
+            });
+            info!(agent = %def.name, models = ucfg.models.len(), "started workflow engine");
         }
     }
 

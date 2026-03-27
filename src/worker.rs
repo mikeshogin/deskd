@@ -337,7 +337,15 @@ pub async fn run(
                     // Write to file-based inbox for async reading.
                     write_inbox(name, &msg, task, Some(response.clone()), None);
 
-                    let target = msg.reply_to.as_deref().unwrap_or(&msg.source);
+                    // If this task was dispatched by the workflow engine, route the
+                    // result back to sm:<instance_id> so the engine processes it.
+                    let target = if let Some(sm_id) =
+                        msg.payload.get("sm_instance_id").and_then(|v| v.as_str())
+                    {
+                        format!("sm:{}", sm_id)
+                    } else {
+                        msg.reply_to.as_deref().unwrap_or(&msg.source).to_string()
+                    };
 
                     let reply = Message {
                         id: Uuid::new_v4().to_string(),

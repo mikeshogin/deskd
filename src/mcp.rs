@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::config::UserConfig;
+use crate::statemachine;
 
 // ─── MCP Protocol types ───────────────────────────────────────────────────────
 
@@ -183,8 +184,31 @@ fn handle_tools_list(
         .map(|c| c.send_message_description(agent_name))
         .unwrap_or_else(|| "Send a message to a target on the bus.".to_string());
 
-    let tools = json!([
-        {
+    // Build sm_create description dynamically listing available models.
+    let sm_create_desc = if let Some(cfg) = user_config
+        && !cfg.models.is_empty()
+    {
+        let model_list: Vec<String> = cfg
+            .models
+            .iter()
+            .map(|m| {
+                if m.description.is_empty() {
+                    format!("  {} ({} states)", m.name, m.states.len())
+                } else {
+                    format!("  {} — {}", m.name, m.description)
+                }
+            })
+            .collect();
+        format!(
+            "Create a new state machine instance. Available models:\n{}",
+            model_list.join("\n")
+        )
+    } else {
+        "Create a new state machine instance.".to_string()
+    };
+
+    let mut tools = vec![
+        json!({
             "name": "send_message",
             "description": send_message_desc,
             "inputSchema": {
@@ -201,8 +225,8 @@ fn handle_tools_list(
                 },
                 "required": ["target", "text"]
             }
-        },
-        {
+        }),
+        json!({
             "name": "add_persistent_agent",
             "description": "Launch a new persistent sub-agent on this agent's bus. The agent starts immediately and remains connected until the bus shuts down.",
             "inputSchema": {
@@ -228,8 +252,50 @@ fn handle_tools_list(
                 },
                 "required": ["name", "model", "system_prompt", "subscribe"]
             }
-        }
-    ]);
+        }),
+    ];
+
+    // Add state machine tools if models are defined.
+    if user_config.map(|c| !c.models.is_empty()).unwrap_or(false) {
+        tools.push(json!({
+            "name": "sm_create",
+            "description": sm_create_desc,
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "model": {"type": "string", "description": "Model name (e.g. 'feature', 'bugfix')"},
+                    "title": {"type": "string", "description": "Instance title"},
+                    "body": {"type": "string", "description": "Instance body/description"}
+                },
+                "required": ["model", "title"]
+            }
+        }));
+        tools.push(json!({
+            "name": "sm_move",
+            "description": "Move a state machine instance to a new state.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Instance ID (e.g. sm-a1b2c3d4)"},
+                    "state": {"type": "string", "description": "Target state name"},
+                    "note": {"type": "string", "description": "Optional note/reason"}
+                },
+                "required": ["id", "state"]
+            }
+        }));
+        tools.push(json!({
+            "name": "sm_query",
+            "description": "Query state machine instances. Returns JSON list of matching instances.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "model": {"type": "string", "description": "Filter by model name"},
+                    "state": {"type": "string", "description": "Filter by current state"},
+                    "id": {"type": "string", "description": "Get specific instance by ID"}
+                }
+            }
+        }));
+    }
 
     Response::ok(id, json!({ "tools": tools }))
 }
@@ -250,6 +316,9 @@ async fn handle_tools_call(
     match name {
         "send_message" => call_send_message(args, agent_name, bus_socket, user_config).await,
         "add_persistent_agent" => call_add_persistent_agent(args, agent_name, bus_socket).await,
+        "sm_create" => call_sm_create(args, agent_name, bus_socket, user_config).await,
+        "sm_move" => call_sm_move(args, agent_name, bus_socket, user_config).await,
+        "sm_query" => call_sm_query(args).await,
         other => bail!("Unknown tool: {}", other),
     }
 }
@@ -411,6 +480,196 @@ async fn call_add_persistent_agent(
                 name, bus_socket, subscribe_display
             )
         }],
+        "isError": false
+    }))
+}
+
+// ─── State machine tool implementations ───────────────────────────────────────
+
+async fn call_sm_create(
+    args: &Value,
+    agent_name: &str,
+    bus_socket: &str,
+    user_config: Option<&UserConfig>,
+) -> Result<Value> {
+    let model_name = args
+        .get("model")
+        .and_then(|m| m.as_str())
+        .context("missing model")?;
+    let title = args
+        .get("title")
+        .and_then(|t| t.as_str())
+        .context("missing title")?;
+    let body = args.get("body").and_then(|b| b.as_str()).unwrap_or("");
+
+    let cfg = user_config.context("no user config loaded — models not available")?;
+    let model = cfg
+        .models
+        .iter()
+        .find(|m| m.name == model_name)
+        .ok_or_else(|| anyhow::anyhow!("model '{}' not found", model_name))?;
+
+    let store = statemachine::StateMachineStore::default_for_home();
+    let inst = store.create(model, title, body, agent_name)?;
+    info!(agent = %agent_name, instance = %inst.id, model = %model_name, "sm_create via MCP");
+
+    // If the initial state has an assignee, dispatch the first task via the bus.
+    if !inst.assignee.is_empty() {
+        let task_text = format!(
+            "---\n## Task: {}\n\n{}\n\n---\n## Metadata\ninstance_id: {}\nmodel: {}\nstate: {}",
+            inst.title, inst.body, inst.id, inst.model, inst.state
+        );
+
+        let mut stream = UnixStream::connect(bus_socket)
+            .await
+            .with_context(|| format!("failed to connect to bus at {}", bus_socket))?;
+
+        let reg = serde_json::json!({
+            "type": "register",
+            "name": format!("{}-mcp-sm", agent_name),
+            "subscriptions": []
+        });
+        let mut line = serde_json::to_string(&reg)?;
+        line.push('\n');
+        stream.write_all(line.as_bytes()).await?;
+
+        let msg = serde_json::json!({
+            "type": "message",
+            "id": Uuid::new_v4().to_string(),
+            "source": "workflow-engine",
+            "target": &inst.assignee,
+            "payload": {
+                "task": task_text,
+                "sm_instance_id": inst.id,
+            },
+            "reply_to": format!("sm:{}", inst.id),
+            "metadata": {"priority": 5u8},
+        });
+        let mut msg_line = serde_json::to_string(&msg)?;
+        msg_line.push('\n');
+        stream.write_all(msg_line.as_bytes()).await?;
+        info!(instance = %inst.id, assignee = %inst.assignee, "dispatched initial task");
+    }
+
+    Ok(json!({
+        "content": [{"type": "text", "text": format!(
+            "Created instance {} (model={}, state={}, assignee={})",
+            inst.id, inst.model, inst.state, inst.assignee
+        )}],
+        "isError": false
+    }))
+}
+
+async fn call_sm_move(
+    args: &Value,
+    agent_name: &str,
+    bus_socket: &str,
+    user_config: Option<&UserConfig>,
+) -> Result<Value> {
+    let id = args
+        .get("id")
+        .and_then(|i| i.as_str())
+        .context("missing id")?;
+    let state = args
+        .get("state")
+        .and_then(|s| s.as_str())
+        .context("missing state")?;
+    let note = args.get("note").and_then(|n| n.as_str());
+
+    let store = statemachine::StateMachineStore::default_for_home();
+    let mut inst = store.load(id)?;
+    let cfg = user_config.context("no user config loaded — models not available")?;
+    let model = cfg
+        .models
+        .iter()
+        .find(|m| m.name == inst.model)
+        .ok_or_else(|| anyhow::anyhow!("model '{}' not found in config", inst.model))?;
+
+    let from = inst.state.clone();
+    store.move_to(&mut inst, model, state, agent_name, note)?;
+    info!(agent = %agent_name, instance = %id, from = %from, to = %state, "sm_move via MCP");
+
+    // If the new state has an assignee, dispatch via bus.
+    if !inst.assignee.is_empty() && !statemachine::is_terminal(model, &inst) {
+        let task_text = format!(
+            "---\n## Task: {}\n\n{}\n\n---\n## Metadata\ninstance_id: {}\nmodel: {}\nstate: {}",
+            inst.title, inst.body, inst.id, inst.model, inst.state
+        );
+
+        let mut stream = UnixStream::connect(bus_socket)
+            .await
+            .with_context(|| format!("failed to connect to bus at {}", bus_socket))?;
+
+        let reg = serde_json::json!({
+            "type": "register",
+            "name": format!("{}-mcp-sm", agent_name),
+            "subscriptions": []
+        });
+        let mut line = serde_json::to_string(&reg)?;
+        line.push('\n');
+        stream.write_all(line.as_bytes()).await?;
+
+        let msg = serde_json::json!({
+            "type": "message",
+            "id": Uuid::new_v4().to_string(),
+            "source": "workflow-engine",
+            "target": &inst.assignee,
+            "payload": {
+                "task": task_text,
+                "sm_instance_id": inst.id,
+            },
+            "reply_to": format!("sm:{}", inst.id),
+            "metadata": {"priority": 5u8},
+        });
+        let mut msg_line = serde_json::to_string(&msg)?;
+        msg_line.push('\n');
+        stream.write_all(msg_line.as_bytes()).await?;
+    }
+
+    Ok(json!({
+        "content": [{"type": "text", "text": format!("{} → {} (model={})", id, inst.state, inst.model)}],
+        "isError": false
+    }))
+}
+
+async fn call_sm_query(args: &Value) -> Result<Value> {
+    // If a specific ID is requested, return just that instance.
+    if let Some(id) = args.get("id").and_then(|i| i.as_str()) {
+        let store = statemachine::StateMachineStore::default_for_home();
+        let inst = store.load(id)?;
+        let inst_json = serde_json::to_value(&inst)?;
+        return Ok(json!({
+            "content": [{"type": "text", "text": serde_json::to_string_pretty(&inst_json)?}],
+            "isError": false
+        }));
+    }
+
+    let store = statemachine::StateMachineStore::default_for_home();
+    let mut instances = store.list_all()?;
+
+    if let Some(model_filter) = args.get("model").and_then(|m| m.as_str()) {
+        instances.retain(|i| i.model == model_filter);
+    }
+    if let Some(state_filter) = args.get("state").and_then(|s| s.as_str()) {
+        instances.retain(|i| i.state == state_filter);
+    }
+
+    let summary: Vec<Value> = instances
+        .iter()
+        .map(|i| {
+            json!({
+                "id": i.id,
+                "model": i.model,
+                "title": i.title,
+                "state": i.state,
+                "assignee": i.assignee,
+                "updated_at": i.updated_at,
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "content": [{"type": "text", "text": serde_json::to_string_pretty(&summary)?}],
         "isError": false
     }))
 }
