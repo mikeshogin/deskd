@@ -115,6 +115,14 @@ enum AgentAction {
         #[arg(long, default_value = "false")]
         clear: bool,
     },
+    /// Show recent completed tasks for an agent (from inbox files).
+    Tasks {
+        /// Agent name, or "all" to show tasks for all agents.
+        name: String,
+        /// Show last N tasks (default 20).
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
     /// Remove an agent (state file + log).
     Rm { name: String },
     /// Spawn an ephemeral sub-agent, run a task, print result, clean up.
@@ -314,6 +322,69 @@ async fn main() -> anyhow::Result<()> {
                     if clear {
                         inbox::clear(&paths)?;
                         println!("({} message(s) cleared)", paths.len());
+                    }
+                }
+            }
+            AgentAction::Tasks { name, limit } => {
+                let all_entries = inbox::read_all()?;
+                let show_all = name == "all";
+                let mut filtered: Vec<_> = if show_all {
+                    all_entries
+                } else {
+                    all_entries
+                        .into_iter()
+                        .filter(|e| e.agent == name)
+                        .collect()
+                };
+                // Sort by timestamp descending (newest first).
+                filtered.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+                filtered.truncate(limit);
+
+                if filtered.is_empty() {
+                    if show_all {
+                        println!("No completed tasks found");
+                    } else {
+                        println!("No completed tasks for {}", name);
+                    }
+                } else {
+                    println!("COMPLETED ({}):", filtered.len());
+                    let now = chrono::Utc::now();
+                    for entry in &filtered {
+                        let age = if let Ok(ts) =
+                            chrono::DateTime::parse_from_rfc3339(&entry.timestamp)
+                        {
+                            let dur = now.signed_duration_since(ts);
+                            format_relative_time(dur)
+                        } else {
+                            "??".to_string()
+                        };
+                        let id_short = if entry.id.len() > 6 {
+                            &entry.id[..6]
+                        } else {
+                            &entry.id
+                        };
+                        let task_excerpt = truncate_main(&entry.task, 36);
+                        let status = if entry.error.is_some() { "err" } else { "done" };
+                        if show_all {
+                            println!(
+                                "  {:<8} {:<12} from:{:<6} {:38} {} {} ago",
+                                id_short,
+                                entry.agent,
+                                entry.source,
+                                format!("\"{}\"", task_excerpt),
+                                status,
+                                age,
+                            );
+                        } else {
+                            println!(
+                                "  {:<8} from:{:<6} {:38} {} {} ago",
+                                id_short,
+                                entry.source,
+                                format!("\"{}\"", task_excerpt),
+                                status,
+                                age,
+                            );
+                        }
                     }
                 }
             }
@@ -620,6 +691,23 @@ async fn upgrade(install_dir_override: Option<String>) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Format a chrono::Duration as a human-readable relative time string (e.g. "5m", "2h", "3d").
+fn format_relative_time(dur: chrono::Duration) -> String {
+    let secs = dur.num_seconds();
+    if secs < 0 {
+        return "now".to_string();
+    }
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
+    }
 }
 
 /// Start per-agent buses and workers for all agents in workspace config.

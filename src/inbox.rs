@@ -73,6 +73,47 @@ pub fn read(agent: &str) -> Result<Vec<(PathBuf, InboxEntry)>> {
     Ok(entries)
 }
 
+/// Read all inbox entries across all source directories, sorted by filename (oldest first).
+pub fn read_all() -> Result<Vec<InboxEntry>> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let base = PathBuf::from(home).join(".deskd").join("inbox");
+    if !base.exists() {
+        return Ok(vec![]);
+    }
+
+    let mut entries: Vec<InboxEntry> = Vec::new();
+    let mut all_paths: Vec<PathBuf> = Vec::new();
+
+    for dir_entry in std::fs::read_dir(&base)? {
+        let dir_entry = dir_entry?;
+        if !dir_entry.file_type()?.is_dir() {
+            continue;
+        }
+        let dir = dir_entry.path();
+        for file_entry in std::fs::read_dir(&dir)? {
+            let file_entry = file_entry?;
+            let path = file_entry.path();
+            if path.extension().map(|e| e == "json").unwrap_or(false) {
+                all_paths.push(path);
+            }
+        }
+    }
+
+    all_paths.sort();
+
+    for path in all_paths {
+        let content = std::fs::read_to_string(&path)?;
+        match serde_json::from_str::<InboxEntry>(&content) {
+            Ok(entry) => entries.push(entry),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "skipping malformed inbox entry");
+            }
+        }
+    }
+
+    Ok(entries)
+}
+
 /// Remove specific inbox files (after reading).
 pub fn clear(paths: &[PathBuf]) -> Result<()> {
     for path in paths {
