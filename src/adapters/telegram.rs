@@ -22,6 +22,14 @@ use uuid::Uuid;
 
 use crate::config::TelegramRoute;
 
+/// Telegram sender metadata passed through the bus payload.
+struct SenderInfo {
+    id: u64,
+    username: Option<String>,
+    first_name: String,
+    is_bot: bool,
+}
+
 pub struct TelegramAdapter {
     token: String,
     routes: Vec<TelegramRoute>,
@@ -470,8 +478,18 @@ async fn polling_loop(
 
                 debug!(agent = %agent, chat_id = chat_id, "received Telegram message");
 
+                // Extract sender metadata from the Telegram message.
+                let sender_info = msg.from.as_ref().map(|u| SenderInfo {
+                    id: u.id.0,
+                    username: u.username.clone(),
+                    first_name: u.first_name.clone(),
+                    is_bot: u.is_bot,
+                });
+                let message_id = msg.id.0;
+                let reply_to_message_id = msg.reply_to_message().map(|r| r.id.0);
+
                 if let Err(e) =
-                    publish_to_bus(&socket, &agent, &text, &target, &reply_to, chat_id, chat_name, image_base64.as_deref())
+                    publish_to_bus(&socket, &agent, &text, &target, &reply_to, chat_id, chat_name, image_base64.as_deref(), sender_info.as_ref(), message_id, reply_to_message_id)
                         .await
                 {
                     warn!(chat_id = chat_id, error = %e, "failed to publish message to bus");
@@ -501,6 +519,9 @@ async fn publish_to_bus(
     chat_id: i64,
     chat_name: Option<String>,
     image_base64: Option<&str>,
+    sender_info: Option<&SenderInfo>,
+    message_id: i32,
+    reply_to_message_id: Option<i32>,
 ) -> Result<()> {
     let mut stream = UnixStream::connect(socket_path)
         .await
@@ -519,7 +540,21 @@ async fn publish_to_bus(
         "task": text,
         "telegram_chat_id": chat_id,
         "telegram_chat_name": chat_name,
+        "telegram_message_id": message_id,
     });
+
+    if let Some(reply_id) = reply_to_message_id {
+        payload["telegram_reply_to_message_id"] = serde_json::json!(reply_id);
+    }
+
+    if let Some(sender) = sender_info {
+        payload["telegram_sender"] = serde_json::json!({
+            "id": sender.id,
+            "username": sender.username,
+            "first_name": sender.first_name,
+            "is_bot": sender.is_bot,
+        });
+    }
 
     if let Some(b64) = image_base64 {
         payload["image_base64"] = serde_json::Value::String(b64.to_string());
