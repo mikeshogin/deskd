@@ -98,9 +98,10 @@ enum AgentAction {
         message: String,
         #[arg(long)]
         max_turns: Option<u32>,
-        /// Bus socket path. Defaults to agent's bus derived from state.
-        #[arg(long, default_value = DEFAULT_SOCKET)]
-        socket: String,
+        /// Bus socket path. When omitted, resolved from agent state file
+        /// (~/.deskd/agents/<name>.yaml → {work_dir}/.deskd/bus.sock).
+        #[arg(long)]
+        socket: Option<String>,
     },
     /// Start the worker loop for an agent (connect to bus, process tasks).
     Run {
@@ -246,9 +247,13 @@ async fn main() -> anyhow::Result<()> {
                 max_turns,
                 socket,
             } => {
-                // Socket priority: explicit --socket (if exists) > agent's bus from state > direct exec.
-                let effective_socket = if std::path::Path::new(&socket).exists() {
-                    Some(socket)
+                // Socket priority: explicit --socket > agent's bus from state > direct exec.
+                let effective_socket = if let Some(ref s) = socket {
+                    if std::path::Path::new(s).exists() {
+                        socket
+                    } else {
+                        None
+                    }
                 } else {
                     agent::load_state(&name).ok().and_then(|s| {
                         let bus = config::agent_bus_socket(&s.config.work_dir);
