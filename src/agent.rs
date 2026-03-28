@@ -455,7 +455,10 @@ pub fn build_command(cfg: &AgentConfig, args: &[String], extra_env: &[(&str, &st
     let mut cmd = match &cfg.unix_user {
         Some(user) => {
             let mut c = Command::new("sudo");
-            c.args(["-u", user, "-H", "--"]);
+            c.args(["-u", user, "-H", "--", "env"]);
+            for (k, v) in extra_env {
+                c.arg(format!("{}={}", k, v));
+            }
             c.arg(bin);
             c.args(prefix);
             c.args(args);
@@ -470,8 +473,10 @@ pub fn build_command(cfg: &AgentConfig, args: &[String], extra_env: &[(&str, &st
             c
         }
     };
-    for (k, v) in extra_env {
-        cmd.env(k, v);
+    if cfg.unix_user.is_none() {
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
     }
     cmd.current_dir(&cfg.work_dir)
         .stdout(Stdio::piped())
