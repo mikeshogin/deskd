@@ -230,7 +230,10 @@ pub async fn run(
                 task_owned = format!("[Telegram: {}]\n{}", label, task_raw);
                 &task_owned as &str
             } else {
-                task_raw
+                // Non-Telegram sources: tag with source so agent can distinguish
+                // automated messages (schedules, other agents) from user messages.
+                task_owned = format!("[source: {}]\n{}", msg.source, task_raw);
+                &task_owned as &str
             };
 
         info!(agent = %name, source = %msg.source, task = %truncate(task, 80), "processing task");

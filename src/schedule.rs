@@ -162,12 +162,12 @@ async fn fire_raw(def: &ScheduleDef, bus_socket: &str, agent_name: &str) -> Resu
     post_to_bus(bus_socket, agent_name, &def.target, text).await
 }
 
-/// Poll GitHub for issues and comments, post new events to the bus.
+/// Poll GitHub for issues, comments, and pull requests, post new events to the bus.
 ///
 /// Config fields:
 ///   `repos`  — list of "owner/repo" strings
 ///   `label`  — filter issues by label (empty string = no filter)
-///   `events` — list of event types: "issues", "issue_comments"
+///   `events` — list of event types: "issues", "issue_comments", "pull_requests"
 ///              (default: ["issues"] for backward compatibility)
 ///
 /// Uses `{home_dir}/.deskd/github_poll_since.json` to track the last poll time per repo,
@@ -257,6 +257,25 @@ async fn fire_github_poll(
                 Ok(n) => count += n,
                 Err(e) => {
                     warn!(agent = %agent_name, repo = %repo, error = %e, "github_poll issue_comments failed");
+                    had_error = true;
+                }
+            }
+        }
+
+        if events.contains(&"pull_requests".to_string()) {
+            match poll_pull_requests(
+                repo,
+                &since,
+                bus_socket,
+                agent_name,
+                &def.target,
+                &ignore_users,
+            )
+            .await
+            {
+                Ok(n) => count += n,
+                Err(e) => {
+                    warn!(agent = %agent_name, repo = %repo, error = %e, "github_poll pull_requests failed");
                     had_error = true;
                 }
             }
@@ -415,6 +434,76 @@ async fn poll_issue_comments(
         info!(agent = %agent_name, repo = %repo, issue = %issue_number, user = %user, "posting github comment to bus");
         if let Err(e) = post_to_bus(bus_socket, agent_name, target, &text).await {
             warn!(error = %e, "failed to post github comment to bus");
+        }
+        count += 1;
+    }
+
+    Ok(count)
+}
+
+/// Poll GitHub pull requests API with `since` filter, post new/updated PRs to bus.
+/// Returns the number of events posted.
+async fn poll_pull_requests(
+    repo: &str,
+    since: &str,
+    bus_socket: &str,
+    agent_name: &str,
+    target: &str,
+    ignore_users: &[String],
+) -> Result<usize> {
+    let endpoint = format!(
+        "repos/{}/pulls?state=open&sort=updated&direction=desc&per_page=100",
+        repo
+    );
+
+    let output = tokio::process::Command::new("gh")
+        .args(["api", &endpoint])
+        .output()
+        .await
+        .context("failed to run gh api for pull requests")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("gh api pull requests failed: {}", stderr.trim());
+    }
+
+    let prs: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
+        .context("failed to parse gh api pull requests output")?;
+
+    let since_dt = chrono::DateTime::parse_from_rfc3339(since)
+        .unwrap_or_else(|_| chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z").unwrap());
+
+    let mut count = 0;
+    for pr in prs {
+        // Filter by updated_at >= since
+        let updated = pr
+            .get("updated_at")
+            .and_then(|u| u.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+        if let Some(updated) = updated
+            && updated < since_dt
+        {
+            continue;
+        }
+
+        let user = pr
+            .get("user")
+            .and_then(|u| u.get("login"))
+            .and_then(|l| l.as_str())
+            .unwrap_or("");
+        if ignore_users.iter().any(|u| u == user) {
+            continue;
+        }
+
+        let title = pr.get("title").and_then(|t| t.as_str()).unwrap_or("");
+        let number = pr.get("number").and_then(|n| n.as_u64()).unwrap_or(0);
+        let body = pr.get("body").and_then(|b| b.as_str()).unwrap_or("");
+        let html_url = pr.get("html_url").and_then(|u| u.as_str()).unwrap_or("");
+
+        let text = format!("New pull request {repo}#{number}: {title}\n{html_url}\n\n{body}");
+        info!(agent = %agent_name, repo = %repo, pr = number, "posting github PR to bus");
+        if let Err(e) = post_to_bus(bus_socket, agent_name, target, &text).await {
+            warn!(error = %e, "failed to post github PR to bus");
         }
         count += 1;
     }
