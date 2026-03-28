@@ -16,8 +16,21 @@ use tracing::info;
 
 const DEFAULT_SOCKET: &str = "/tmp/deskd.sock";
 
+fn version_string() -> &'static str {
+    // Constructed once via a static; includes git hash when available.
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        let hash = env!("GIT_HASH");
+        if hash.is_empty() {
+            env!("CARGO_PKG_VERSION").to_string()
+        } else {
+            format!("{} ({})", env!("CARGO_PKG_VERSION"), hash)
+        }
+    })
+}
+
 #[derive(Parser)]
-#[command(name = "deskd", about = "Agent orchestration runtime")]
+#[command(name = "deskd", about = "Agent orchestration runtime", version = version_string())]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
