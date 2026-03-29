@@ -373,7 +373,7 @@ pub async fn run(
             };
 
         info!(agent = %name, source = %msg.source, task = %truncate(task, 80), "processing task");
-        let task_start = std::time::Instant::now();
+        let _task_start = std::time::Instant::now();
 
         // Mark agent as working so `deskd status` can report live state.
         if let Ok(mut st) = agent::load_state(name) {

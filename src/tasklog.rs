@@ -274,7 +274,6 @@ pub fn truncate_task(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
-
     fn temp_dir() -> PathBuf {
         PathBuf::from(format!(
             "/tmp/deskd-test-tasklog-{}",
