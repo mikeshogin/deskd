@@ -23,6 +23,14 @@ serenity = { version = "0.12", default-features = false, features = ["client", "
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 base64 = "0.22.1"
 
+[[bin]]
+name = "deskd"
+path = "src/main.rs"
+
+[[bin]]
+name = "session2graph"
+path = "src/bin/session2graph.rs"
+
 [features]
 default = []
 vendored-openssl = ["openssl"]

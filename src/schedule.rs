@@ -148,7 +148,7 @@ async fn fire(def: &ScheduleDef, bus_socket: &str, agent_name: &str, home_dir: &
     match def.action {
         ScheduleAction::Raw => fire_raw(def, bus_socket, agent_name).await,
         ScheduleAction::GithubPoll => fire_github_poll(def, bus_socket, agent_name, home_dir).await,
-        ScheduleAction::Shell => fire_shell(def, bus_socket, agent_name).await,
+        ScheduleAction::Shell => fire_shell(def, bus_socket, agent_name, home_dir).await,
     }
 }
 
@@ -641,7 +641,12 @@ fn save_since_state(home_dir: &str, state: &HashMap<String, String>) {
 /// Run an arbitrary shell command via `sh -c`.
 /// If the command exits successfully and produces stdout, it is posted to the bus target.
 /// If the command fails, the error is logged (no bus message).
-async fn fire_shell(def: &ScheduleDef, bus_socket: &str, agent_name: &str) -> Result<()> {
+async fn fire_shell(
+    def: &ScheduleDef,
+    bus_socket: &str,
+    agent_name: &str,
+    home_dir: &str,
+) -> Result<()> {
     let command = def
         .config
         .as_ref()
@@ -661,6 +666,7 @@ async fn fire_shell(def: &ScheduleDef, bus_socket: &str, agent_name: &str) -> Re
 
     let output = tokio::process::Command::new("sh")
         .args(["-c", command])
+        .current_dir(home_dir)
         .output()
         .await
         .with_context(|| format!("failed to spawn shell command: {}", command))?;
@@ -859,6 +865,35 @@ mod tests {
         // Verify file exists at expected path
         let path = since_state_path(&home_dir);
         assert!(path.exists(), "since state file should exist at {:?}", path);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_fire_shell_uses_home_dir_as_working_directory() {
+        // Create a temp directory to act as home_dir
+        let dir = std::env::temp_dir().join("deskd_test_shell_workdir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let home_dir = dir.to_string_lossy().to_string();
+
+        // Write a marker file in the temp dir
+        std::fs::write(dir.join("marker.txt"), "hello from workdir").unwrap();
+
+        // Build a ScheduleDef with a shell command that reads the marker file
+        let config: serde_yaml::Value =
+            serde_yaml::from_str("command: \"cat marker.txt\"").unwrap();
+        let def = ScheduleDef {
+            cron: "0 0 * * * *".to_string(),
+            target: String::new(), // empty target — output won't be posted
+            action: ScheduleAction::Shell,
+            config: Some(config),
+        };
+
+        // fire_shell should succeed because marker.txt exists in home_dir
+        // We use a dummy bus_socket since target is empty and output won't be sent
+        let result = fire_shell(&def, "/tmp/nonexistent.sock", "test-agent", &home_dir).await;
+        assert!(result.is_ok(), "fire_shell should succeed: {:?}", result);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
