@@ -143,44 +143,89 @@ pub struct ExecContext {
 }
 
 impl ExecContext {
+    /// Build LLM context from the full transitive subgraph using compression.
+    ///
+    /// LLM nodes act as compression boundaries: they already "digested" everything
+    /// upstream of them.  So the context for a new LLM node is:
+    ///
+    /// 1. Find the nearest LLM ancestor(s) in the transitive subgraph
+    /// 2. Include their output (compressed knowledge)
+    /// 3. Include full tool results for steps *between* those LLM nodes and current
+    /// 4. Skip anything upstream of a compression boundary
+    ///
+    /// This keeps context bounded even for deep graphs.
+    pub fn llm_context(
+        &self,
+        current_step: &str,
+        graph: &GraphDef,
+        exec_order: &[String],
+    ) -> String {
+        let step_map: HashMap<&str, &StepDef> =
+            graph.steps.iter().map(|s| (s.id.as_str(), s)).collect();
+
+        // Compute transitive dependencies (all ancestors).
+        let ancestors = transitive_deps(current_step, &step_map);
+
+        // Walk execution order (topological) and find the last LLM boundary.
+        // Everything after that boundary (in exec order) gets full context.
+        // The boundary itself gets included as compressed output only.
+        let mut last_llm_boundary: Option<&str> = None;
+        for id in exec_order {
+            if !ancestors.contains(id.as_str()) {
+                continue;
+            }
+            if let Some(result) = self.results.get(id.as_str())
+                && result.step_type == "llm"
+                && !result.skipped
+            {
+                last_llm_boundary = Some(id.as_str());
+            }
+        }
+
+        let mut parts = Vec::new();
+
+        // If there's a compression boundary, include its output first.
+        if let Some(boundary_id) = last_llm_boundary
+            && let Some(result) = self.results.get(boundary_id)
+            && let Some(ref output) = result.llm_output
+        {
+            parts.push(format!(
+                "## Summary from step `{}` (compressed)\n{}\n",
+                boundary_id, output
+            ));
+        }
+
+        // Include full results for ancestors that come after the boundary.
+        let after_boundary = last_llm_boundary.is_none(); // if no boundary, include everything
+        let mut past_boundary = after_boundary;
+        for id in exec_order {
+            if !ancestors.contains(id.as_str()) {
+                continue;
+            }
+            if let Some(bid) = last_llm_boundary
+                && id == bid
+            {
+                past_boundary = true;
+                continue; // skip the boundary itself (already included above)
+            }
+            if !past_boundary {
+                continue;
+            }
+            if let Some(result) = self.results.get(id.as_str()) {
+                parts.push(format_step_result(id, result));
+            }
+        }
+
+        parts.join("\n")
+    }
+
     /// Collect all results from a set of dependency step IDs into a summary string
-    /// suitable for LLM prompts.
+    /// suitable for LLM prompts. (Legacy — used when graph/order not available.)
     pub fn upstream_summary(&self, dep_ids: &[String]) -> String {
         let mut parts = Vec::new();
         for dep_id in dep_ids {
-            if let Some(result) = self.results.get(dep_id) {
-                if result.skipped {
-                    parts.push(format!("## Step `{}` — SKIPPED\n", dep_id));
-                    continue;
-                }
-                match result.step_type.as_str() {
-                    "llm" => {
-                        if let Some(ref output) = result.llm_output {
-                            parts.push(format!("## Step `{}`\n{}\n", dep_id, output));
-                        }
-                    }
-                    _ => {
-                        let mut step_parts = Vec::new();
-                        for tr in &result.tool_results {
-                            if tr.skipped {
-                                continue;
-                            }
-                            step_parts.push(format!(
-                                "### `{} {}`\nExit code: {}\nStdout:\n```\n{}\n```{}",
-                                tr.tool,
-                                tr.args,
-                                tr.exit_code,
-                                tr.stdout.trim(),
-                                if tr.stderr.trim().is_empty() {
-                                    String::new()
-                                } else {
-                                    format!("\nStderr:\n```\n{}\n```", tr.stderr.trim())
-                                }
-                            ));
-                        }
-                        parts.push(format!("## Step `{}`\n{}\n", dep_id, step_parts.join("\n")));
-                    }
-                }
+            if let Some(result) = self.results.get(dep_id.as_str()) {
+                parts.push(format_step_result(dep_id, result));
             }
         }
         parts.join("\n")
@@ -308,6 +353,65 @@ impl ExecContext {
             serde_json::Value::Null => {}
         }
     }
+}
+
+/// Format a single step result for inclusion in LLM context.
+fn format_step_result(step_id: &str, result: &StepResult) -> String {
+    if result.skipped {
+        return format!("## Step `{}` — SKIPPED\n", step_id);
+    }
+    match result.step_type.as_str() {
+        "llm" => {
+            if let Some(ref output) = result.llm_output {
+                format!("## Step `{}`\n{}\n", step_id, output)
+            } else {
+                String::new()
+            }
+        }
+        _ => {
+            let mut step_parts = Vec::new();
+            for tr in &result.tool_results {
+                if tr.skipped {
+                    continue;
+                }
+                step_parts.push(format!(
+                    "### `{} {}`\nExit code: {}\nStdout:\n```\n{}\n```{}",
+                    tr.tool,
+                    tr.args,
+                    tr.exit_code,
+                    tr.stdout.trim(),
+                    if tr.stderr.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!("\nStderr:\n```\n{}\n```", tr.stderr.trim())
+                    }
+                ));
+            }
+            format!("## Step `{}`\n{}\n", step_id, step_parts.join("\n"))
+        }
+    }
+}
+
+/// Compute transitive dependencies for a step (all ancestors in the DAG).
+fn transitive_deps<'a>(step_id: &str, step_map: &HashMap<&'a str, &'a StepDef>) -> HashSet<String> {
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::new();
+    if let Some(step) = step_map.get(step_id) {
+        for dep in &step.depends_on {
+            queue.push_back(dep.clone());
+        }
+    }
+    while let Some(id) = queue.pop_front() {
+        if !visited.insert(id.clone()) {
+            continue;
+        }
+        if let Some(step) = step_map.get(id.as_str()) {
+            for dep in &step.depends_on {
+                queue.push_back(dep.clone());
+            }
+        }
+    }
+    visited
 }
 
 /// Extract a JSON block from text that may be wrapped in ```json ... ``` markers.
@@ -681,8 +785,9 @@ pub async fn execute(
                     .as_deref()
                     .unwrap_or("Analyze the results from previous steps.");
 
-                // Build prompt with upstream results.
-                let upstream = ctx.upstream_summary(&step.depends_on);
+                // Build prompt with full transitive context using compression.
+                // LLM ancestors act as compression boundaries.
+                let upstream = ctx.llm_context(step_id, graph, &order);
                 let expanded_prompt = ctx.expand_template(prompt_template);
                 let full_prompt = format!(
                     "# Context from previous steps\n\n{}\n\n# Your task\n\n{}",
@@ -928,6 +1033,199 @@ steps:
         let summary = ctx.upstream_summary(&["step_a".to_string()]);
         assert!(summary.contains("hello"));
         assert!(summary.contains("step_a"));
+    }
+
+    #[test]
+    fn test_llm_context_compression_boundary() {
+        // Graph: tool_a → llm_b → tool_c → llm_d (current)
+        // llm_d should see: llm_b output (compressed) + tool_c full output
+        // It should NOT see tool_a full output (behind the boundary).
+        let graph: GraphDef = serde_yaml::from_str(
+            r#"
+graph: compression-test
+steps:
+  - id: tool_a
+    tools: [{ tool: "bash", args: "echo raw_data" }]
+  - id: llm_b
+    type: llm
+    depends_on: [tool_a]
+    prompt: "Summarize"
+  - id: tool_c
+    depends_on: [llm_b]
+    tools: [{ tool: "bash", args: "echo new_data" }]
+  - id: llm_d
+    type: llm
+    depends_on: [tool_c]
+    prompt: "Decide"
+"#,
+        )
+        .unwrap();
+
+        let order = topo_sort(&graph).unwrap();
+
+        let mut ctx = ExecContext::default();
+        ctx.results.insert(
+            "tool_a".to_string(),
+            StepResult {
+                id: "tool_a".to_string(),
+                step_type: "tool".to_string(),
+                skipped: false,
+                tool_results: vec![ToolResult {
+                    tool: "bash".to_string(),
+                    args: "echo raw_data".to_string(),
+                    stdout: "raw_data\n".to_string(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                    skipped: false,
+                }],
+                llm_output: None,
+                duration_ms: 10,
+            },
+        );
+        ctx.results.insert(
+            "llm_b".to_string(),
+            StepResult {
+                id: "llm_b".to_string(),
+                step_type: "llm".to_string(),
+                skipped: false,
+                tool_results: Vec::new(),
+                llm_output: Some("The data says raw_data — all good.".to_string()),
+                duration_ms: 500,
+            },
+        );
+        ctx.results.insert(
+            "tool_c".to_string(),
+            StepResult {
+                id: "tool_c".to_string(),
+                step_type: "tool".to_string(),
+                skipped: false,
+                tool_results: vec![ToolResult {
+                    tool: "bash".to_string(),
+                    args: "echo new_data".to_string(),
+                    stdout: "new_data\n".to_string(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                    skipped: false,
+                }],
+                llm_output: None,
+                duration_ms: 10,
+            },
+        );
+
+        let context = ctx.llm_context("llm_d", &graph, &order);
+
+        // Should contain llm_b output (compression boundary)
+        assert!(context.contains("compressed"));
+        assert!(context.contains("The data says raw_data"));
+
+        // Should contain tool_c output (after boundary)
+        assert!(context.contains("new_data"));
+
+        // Should NOT contain tool_a raw output (before boundary)
+        assert!(
+            !context.contains("### `bash echo raw_data`"),
+            "tool_a raw output should be hidden behind compression boundary"
+        );
+    }
+
+    #[test]
+    fn test_llm_context_no_boundary() {
+        // Graph: tool_a → tool_b → llm_c (current)
+        // No LLM boundary — llm_c should see both tool_a and tool_b.
+        let graph: GraphDef = serde_yaml::from_str(
+            r#"
+graph: no-boundary
+steps:
+  - id: tool_a
+    tools: [{ tool: "bash", args: "echo first" }]
+  - id: tool_b
+    depends_on: [tool_a]
+    tools: [{ tool: "bash", args: "echo second" }]
+  - id: llm_c
+    type: llm
+    depends_on: [tool_b]
+    prompt: "Analyze"
+"#,
+        )
+        .unwrap();
+
+        let order = topo_sort(&graph).unwrap();
+
+        let mut ctx = ExecContext::default();
+        ctx.results.insert(
+            "tool_a".to_string(),
+            StepResult {
+                id: "tool_a".to_string(),
+                step_type: "tool".to_string(),
+                skipped: false,
+                tool_results: vec![ToolResult {
+                    tool: "bash".to_string(),
+                    args: "echo first".to_string(),
+                    stdout: "first\n".to_string(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                    skipped: false,
+                }],
+                llm_output: None,
+                duration_ms: 10,
+            },
+        );
+        ctx.results.insert(
+            "tool_b".to_string(),
+            StepResult {
+                id: "tool_b".to_string(),
+                step_type: "tool".to_string(),
+                skipped: false,
+                tool_results: vec![ToolResult {
+                    tool: "bash".to_string(),
+                    args: "echo second".to_string(),
+                    stdout: "second\n".to_string(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                    skipped: false,
+                }],
+                llm_output: None,
+                duration_ms: 10,
+            },
+        );
+
+        let context = ctx.llm_context("llm_c", &graph, &order);
+
+        // Without a boundary, both tools should be fully visible.
+        assert!(context.contains("first"));
+        assert!(context.contains("second"));
+    }
+
+    #[test]
+    fn test_transitive_deps() {
+        let graph: GraphDef = serde_yaml::from_str(
+            r#"
+graph: deps
+steps:
+  - id: a
+    tools: [{ tool: "bash", args: "echo a" }]
+  - id: b
+    depends_on: [a]
+    tools: [{ tool: "bash", args: "echo b" }]
+  - id: c
+    depends_on: [b]
+    tools: [{ tool: "bash", args: "echo c" }]
+  - id: d
+    depends_on: [c, a]
+    tools: [{ tool: "bash", args: "echo d" }]
+"#,
+        )
+        .unwrap();
+
+        let step_map: HashMap<&str, &StepDef> =
+            graph.steps.iter().map(|s| (s.id.as_str(), s)).collect();
+
+        let deps = transitive_deps("d", &step_map);
+        assert!(deps.contains("a"));
+        assert!(deps.contains("b"));
+        assert!(deps.contains("c"));
+        assert!(!deps.contains("d")); // self not included
+        assert_eq!(deps.len(), 3);
     }
 
     #[tokio::test]
