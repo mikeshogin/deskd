@@ -15,6 +15,8 @@ mod unified_inbox;
 mod worker;
 mod workflow;
 
+use std::str::FromStr;
+
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 use tracing::info;
@@ -746,6 +748,28 @@ async fn main() -> anyhow::Result<()> {
                     "{:<12} {:<9} {:<6} ${:<9.4} {}",
                     def.name, status, turns, cost, current_task
                 );
+
+                // Show registered schedules for this agent.
+                let cfg_path = def.config_path();
+                if let Ok(user_cfg) = config::UserConfig::load(&cfg_path)
+                    && !user_cfg.schedules.is_empty()
+                {
+                    for sched in &user_cfg.schedules {
+                        let action_label = format!("{:?}", sched.action).to_lowercase();
+                        let next = cron::Schedule::from_str(&sched.cron)
+                            .ok()
+                            .and_then(|s| s.upcoming(chrono::Utc).next())
+                            .map(|t| {
+                                let dur = t - chrono::Utc::now();
+                                format_relative_time(dur)
+                            })
+                            .unwrap_or_else(|| "?".to_string());
+                        println!(
+                            "  {:<18} {:<14} → {:<24} next {}",
+                            sched.cron, action_label, sched.target, next
+                        );
+                    }
+                }
             }
         }
         Commands::Restart { config } => {
