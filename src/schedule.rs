@@ -907,4 +907,109 @@ mod tests {
         let state = load_since_state(&home_dir);
         assert!(state.is_empty());
     }
+
+    #[test]
+    fn test_start_creates_handles_per_schedule_def() {
+        // start() requires a tokio runtime because it calls tokio::spawn.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let defs = vec![
+                ScheduleDef {
+                    cron: "0 9 * * *".into(),
+                    target: "agent:family".into(),
+                    action: ScheduleAction::Raw,
+                    config: Some(serde_yaml::Value::String("morning brief".into())),
+                },
+                ScheduleDef {
+                    cron: "0 21 * * *".into(),
+                    target: "agent:family".into(),
+                    action: ScheduleAction::Raw,
+                    config: Some(serde_yaml::Value::String("evening check".into())),
+                },
+            ];
+
+            let handles = start(
+                defs,
+                "/tmp/nonexistent.sock".into(),
+                "family".into(),
+                "/tmp/family_test".into(),
+            );
+
+            assert_eq!(
+                handles.len(),
+                2,
+                "should create one handle per schedule def"
+            );
+
+            // Clean up: abort the spawned tasks
+            for h in handles {
+                h.abort();
+            }
+        });
+    }
+
+    #[test]
+    fn test_load_schedules_from_agent_config_file() {
+        // Verify that UserConfig::load() picks up schedules from an agent-level
+        // deskd.yaml, which is the mechanism used by watch_and_reload().
+        let dir = std::env::temp_dir().join("deskd_test_agent_schedules");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let config_path = dir.join("deskd.yaml");
+        let yaml = r#"
+model: claude-sonnet-4-6
+system_prompt: "Family assistant"
+
+schedules:
+  - cron: "3 7 * * *"
+    target: "agent:family"
+    action: raw
+    config: "Morning brief"
+  - cron: "3 21 * * *"
+    target: "agent:family"
+    action: github_poll
+    config:
+      repos:
+        - kgatilin/deskd
+      label: agent-ready
+  - cron: "7 22 * * *"
+    target: "agent:family"
+    action: shell
+    config:
+      command: "echo hello"
+"#;
+        std::fs::write(&config_path, yaml).unwrap();
+
+        let cfg = crate::config::UserConfig::load(&config_path.to_string_lossy()).unwrap();
+
+        assert_eq!(cfg.schedules.len(), 3);
+        assert_eq!(cfg.schedules[0].cron, "3 7 * * *");
+        assert_eq!(cfg.schedules[0].target, "agent:family");
+        assert!(matches!(cfg.schedules[0].action, ScheduleAction::Raw));
+        assert!(matches!(
+            cfg.schedules[1].action,
+            ScheduleAction::GithubPoll
+        ));
+        assert!(matches!(cfg.schedules[2].action, ScheduleAction::Shell));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_file_mtime_returns_none_for_missing_file() {
+        assert!(file_mtime("/tmp/definitely_nonexistent_deskd_test_file.yaml").is_none());
+    }
+
+    #[test]
+    fn test_file_mtime_returns_some_for_existing_file() {
+        let dir = std::env::temp_dir().join("deskd_test_mtime");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.yaml");
+        std::fs::write(&path, "test").unwrap();
+
+        assert!(file_mtime(&path.to_string_lossy()).is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

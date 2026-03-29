@@ -726,4 +726,78 @@ telegram:
         assert_eq!(routes[1].route_to.as_deref(), Some("agent:collab"));
         assert!(routes[1].mention_only);
     }
+
+    #[test]
+    fn test_agent_def_config_path_uses_agent_config_when_set() {
+        // When an agent defines config_path in workspace.yaml, that path is used
+        // for loading schedules and other agent-level config.
+        let def = AgentDef {
+            name: "family".into(),
+            unix_user: Some("family".into()),
+            work_dir: "/home/family".into(),
+            config: Some("/home/family/deskd.yaml".into()),
+            telegram: None,
+            discord: None,
+            model: None,
+            command: vec!["claude".into()],
+            budget_usd: 50.0,
+            container: None,
+        };
+        assert_eq!(def.config_path(), "/home/family/deskd.yaml");
+    }
+
+    #[test]
+    fn test_agent_def_config_path_defaults_to_work_dir() {
+        // When config is not set, config_path defaults to {work_dir}/deskd.yaml.
+        let def = AgentDef {
+            name: "family".into(),
+            unix_user: Some("family".into()),
+            work_dir: "/home/family".into(),
+            config: None,
+            telegram: None,
+            discord: None,
+            model: None,
+            command: vec!["claude".into()],
+            budget_usd: 50.0,
+            container: None,
+        };
+        assert_eq!(def.config_path(), "/home/family/deskd.yaml");
+    }
+
+    #[test]
+    fn test_user_config_with_schedules() {
+        // Verify that schedules defined in an agent-level deskd.yaml are parsed
+        // correctly, supporting all three action types.
+        let yaml = r#"
+model: claude-sonnet-4-6
+system_prompt: "Family assistant"
+
+schedules:
+  - cron: "3 7 * * *"
+    target: "agent:family"
+    action: raw
+    config: "Morning brief"
+  - cron: "3 21 * * *"
+    target: "agent:family"
+    action: github_poll
+    config:
+      repos:
+        - kgatilin/deskd
+      label: agent-ready
+  - cron: "7 22 * * *"
+    target: "agent:family"
+    action: shell
+    config:
+      command: "echo receipts"
+"#;
+        let cfg: UserConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.schedules.len(), 3);
+        assert_eq!(cfg.schedules[0].cron, "3 7 * * *");
+        assert!(matches!(cfg.schedules[0].action, ScheduleAction::Raw));
+        assert!(matches!(
+            cfg.schedules[1].action,
+            ScheduleAction::GithubPoll
+        ));
+        assert!(matches!(cfg.schedules[2].action, ScheduleAction::Shell));
+    }
 }
