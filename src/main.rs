@@ -9,6 +9,7 @@ mod mcp;
 mod message;
 mod schedule;
 mod statemachine;
+mod tasklog;
 mod unified_inbox;
 mod worker;
 mod workflow;
@@ -180,6 +181,26 @@ enum AgentAction {
         /// Show last N tasks (default 20).
         #[arg(long, default_value = "20")]
         limit: usize,
+    },
+    /// Show task history for an agent (from structured task log).
+    Logs {
+        /// Agent name.
+        name: String,
+        /// Show last N tasks (default 20).
+        #[arg(long, default_value = "20")]
+        limit: usize,
+        /// Filter by source (e.g. telegram, github_poll, schedule).
+        #[arg(long)]
+        source: Option<String>,
+        /// Show tasks from the last duration (e.g. 1h, 24h, 7d).
+        #[arg(long)]
+        since: Option<String>,
+        /// Output raw JSONL instead of formatted table.
+        #[arg(long, default_value = "false")]
+        json: bool,
+        /// Show cost summary instead of task list.
+        #[arg(long, default_value = "false")]
+        cost: bool,
     },
     /// Remove an agent (state file + log).
     Rm { name: String },
@@ -491,6 +512,38 @@ async fn main() -> anyhow::Result<()> {
                             );
                         }
                     }
+                }
+            }
+            AgentAction::Logs {
+                name,
+                limit,
+                source,
+                since,
+                json,
+                cost,
+            } => {
+                let since_dt = if let Some(ref dur) = since {
+                    let secs = parse_duration_secs(dur)?;
+                    Some(chrono::Utc::now() - chrono::Duration::seconds(secs as i64))
+                } else {
+                    None
+                };
+
+                let entries = tasklog::read_logs(
+                    &name,
+                    if cost { usize::MAX } else { limit },
+                    source.as_deref(),
+                    since_dt,
+                )?;
+
+                if entries.is_empty() {
+                    println!("No task logs for {}", name);
+                } else if cost {
+                    tasklog::print_cost_summary(&name, &entries, since.as_deref());
+                } else if json {
+                    tasklog::print_json(&entries);
+                } else {
+                    tasklog::print_table(&entries);
                 }
             }
             AgentAction::Rm { name } => {
@@ -1030,6 +1083,10 @@ fn parse_duration_secs(s: &str) -> anyhow::Result<u64> {
             current_num.clear();
 
             match ch {
+                'd' => {
+                    total += n * 86400;
+                    found_any = true;
+                }
                 'h' => {
                     total += n * 3600;
                     found_any = true;
@@ -1043,7 +1100,11 @@ fn parse_duration_secs(s: &str) -> anyhow::Result<u64> {
                     found_any = true;
                 }
                 other => {
-                    anyhow::bail!("unknown unit '{}' in duration '{}' (use h, m, s)", other, s)
+                    anyhow::bail!(
+                        "unknown unit '{}' in duration '{}' (use d, h, m, s)",
+                        other,
+                        s
+                    )
                 }
             }
         }
@@ -1368,8 +1429,18 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_duration_days() {
+        assert_eq!(parse_duration_secs("5d").unwrap(), 5 * 86400);
+    }
+
+    #[test]
+    fn test_parse_duration_days_and_hours() {
+        assert_eq!(parse_duration_secs("7d12h").unwrap(), 7 * 86400 + 12 * 3600);
+    }
+
+    #[test]
     fn test_parse_duration_invalid_unit() {
-        assert!(parse_duration_secs("5d").is_err());
+        assert!(parse_duration_secs("5w").is_err());
     }
 
     #[test]

@@ -10,6 +10,7 @@ use crate::agent::{self, TokenUsage};
 use crate::config::{AgentRuntime, SessionMode};
 use crate::inbox;
 use crate::message::Message;
+use crate::tasklog;
 use crate::unified_inbox;
 
 /// Wrapper for either a Claude or ACP agent process.
@@ -247,6 +248,27 @@ pub async fn run(
                 "budget exceeded, rejecting task"
             );
 
+            // Log budget skip.
+            let skip_task = msg
+                .payload
+                .get("task")
+                .and_then(|t| t.as_str())
+                .unwrap_or_default();
+            let log_entry = tasklog::TaskLog {
+                ts: chrono::Utc::now().to_rfc3339(),
+                source: msg.source.clone(),
+                turns: 0,
+                cost: 0.0,
+                duration_ms: 0,
+                status: "skip".to_string(),
+                task: tasklog::truncate_task(skip_task, 60),
+                error: Some("budget exceeded".to_string()),
+                msg_id: msg.id.clone(),
+            };
+            if let Err(e) = tasklog::log_task(name, &log_entry) {
+                warn!(agent = %name, error = %e, "failed to write task log");
+            }
+
             // Notify the sender so they get a visible error instead of silence.
             let budget_error = format!(
                 "Budget limit reached (${:.2} / ${:.2}). Task not processed.",
@@ -272,6 +294,20 @@ pub async fn run(
 
         if task_raw.is_empty() {
             debug!(agent = %name, "message has no task payload, skipping");
+            let log_entry = tasklog::TaskLog {
+                ts: chrono::Utc::now().to_rfc3339(),
+                source: msg.source.clone(),
+                turns: 0,
+                cost: 0.0,
+                duration_ms: 0,
+                status: "empty".to_string(),
+                task: String::new(),
+                error: None,
+                msg_id: msg.id.clone(),
+            };
+            if let Err(e) = tasklog::log_task(name, &log_entry) {
+                warn!(agent = %name, error = %e, "failed to write task log");
+            }
             continue;
         }
 
@@ -467,6 +503,8 @@ pub async fn run(
 
         let image = image_base64.as_deref().zip(image_media_type.as_deref());
 
+        let task_start = std::time::Instant::now();
+
         // Use the persistent process. send_task writes to its stdin and reads
         // stdout events until the result event marks the turn complete.
         let mut task_fut = Box::pin(process.send_task(task, Some(&progress_tx), image, &limits));
@@ -553,6 +591,7 @@ pub async fn run(
 
         set_idle(name);
         let task_duration = task_start.elapsed().as_secs();
+        let task_duration_ms = task_start.elapsed().as_millis() as u64;
         match result {
             Ok(ref turn) => {
                 info!(
@@ -572,6 +611,22 @@ pub async fn run(
                     task_duration,
                     &initial_state.config.model,
                 );
+
+                // Log task completion.
+                let log_entry = tasklog::TaskLog {
+                    ts: chrono::Utc::now().to_rfc3339(),
+                    source: msg.source.clone(),
+                    turns: turn.num_turns,
+                    cost: turn.cost_usd,
+                    duration_ms: task_duration_ms,
+                    status: "ok".to_string(),
+                    task: tasklog::truncate_task(task_raw, 60),
+                    error: None,
+                    msg_id: msg.id.clone(),
+                };
+                if let Err(e) = tasklog::log_task(name, &log_entry) {
+                    warn!(agent = %name, error = %e, "failed to write task log");
+                }
 
                 // Write to file-based inbox for all senders.
                 let response = if full_response.is_empty() {
@@ -595,6 +650,22 @@ pub async fn run(
             Err(e) => {
                 let err_str = format!("{}", e);
                 warn!(agent = %name, error = %err_str, "task failed");
+
+                // Log task failure.
+                let log_entry = tasklog::TaskLog {
+                    ts: chrono::Utc::now().to_rfc3339(),
+                    source: msg.source.clone(),
+                    turns: 0,
+                    cost: 0.0,
+                    duration_ms: task_duration_ms,
+                    status: "error".to_string(),
+                    task: tasklog::truncate_task(task_raw, 60),
+                    error: Some(err_str.clone()),
+                    msg_id: msg.id.clone(),
+                };
+                if let Err(le) = tasklog::log_task(name, &log_entry) {
+                    warn!(agent = %name, error = %le, "failed to write task log");
+                }
 
                 // If the persistent process died, try to restart it.
                 if err_str.contains("process exited") || err_str.contains("stdin closed") {
