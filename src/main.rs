@@ -1,3 +1,4 @@
+mod acp;
 mod adapters;
 mod agent;
 mod bus;
@@ -281,6 +282,7 @@ async fn main() -> anyhow::Result<()> {
                     config_path: None,
                     container: None,
                     session: config::SessionMode::default(),
+                    runtime: config::AgentRuntime::default(),
                 };
                 let state = agent::create(&cfg).await?;
                 println!("Agent {} created", state.config.name);
@@ -1244,6 +1246,7 @@ async fn serve(config_path: String) -> anyhow::Result<()> {
                     config_path: Some(cfg_path.clone()),
                     container: def.container.clone(),
                     session: sub.session.clone(),
+                    runtime: sub.runtime.clone(),
                 };
                 agent::create_or_update_from_config(&sub_cfg).await?;
 

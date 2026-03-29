@@ -7,7 +7,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
-use crate::config::{self, ContainerConfig, SessionMode, UserConfig};
+use crate::config::{self, AgentRuntime, ContainerConfig, SessionMode, UserConfig};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -34,6 +34,9 @@ pub struct AgentConfig {
     /// Session mode: persistent (default) or ephemeral.
     #[serde(default)]
     pub session: SessionMode,
+    /// Agent runtime protocol: claude (default) or acp.
+    #[serde(default)]
+    pub runtime: AgentRuntime,
 }
 
 fn default_budget_usd() -> f64 {
@@ -171,6 +174,7 @@ pub async fn create_or_recover(
         config_path: Some(def.config_path()),
         container: def.container.clone(),
         session: SessionMode::default(),
+        runtime: def.runtime.clone(),
     };
 
     let path = state_path(&def.name);
@@ -651,6 +655,7 @@ pub async fn spawn_ephemeral(
         config_path: None,
         container: None,
         session: SessionMode::default(),
+        runtime: AgentRuntime::default(),
     };
 
     create(&cfg).await?;
@@ -1146,6 +1151,7 @@ created_at: "2024-01-01T00:00:00Z"
             config_path: Some("/home/agent1/deskd.yaml".to_string()),
             container: None,
             session: SessionMode::default(),
+            runtime: AgentRuntime::default(),
         };
         let state = AgentState {
             config: cfg,
@@ -1261,6 +1267,7 @@ created_at: "2024-01-01T00:00:00Z"
             config_path: Some("/home/test/deskd.yaml".to_string()),
             container: Some(container),
             session: SessionMode::default(),
+            runtime: AgentRuntime::default(),
         };
 
         let extra_env = [("DESKD_BUS_SOCKET", "/home/test/.deskd/bus.sock")];
@@ -1310,6 +1317,7 @@ created_at: "2024-01-01T00:00:00Z"
             config_path: None,
             container: None,
             session: SessionMode::default(),
+            runtime: AgentRuntime::default(),
         };
         let cmd = build_command(&cfg, &[], &[]);
         let program = cmd.as_std().get_program().to_string_lossy().to_string();

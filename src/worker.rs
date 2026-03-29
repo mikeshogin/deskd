@@ -4,11 +4,88 @@ use tokio::net::UnixStream;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::acp;
 use crate::agent;
-use crate::config::SessionMode;
+use crate::config::{AgentRuntime, SessionMode};
 use crate::inbox;
 use crate::message::Message;
 use crate::unified_inbox;
+
+/// Wrapper for either a Claude or ACP agent process.
+enum RuntimeProcess {
+    Claude(agent::AgentProcess),
+    Acp(acp::AcpProcess),
+}
+
+impl RuntimeProcess {
+    async fn start(name: &str, bus_socket: &str, runtime: &AgentRuntime) -> Result<Self> {
+        match runtime {
+            AgentRuntime::Claude => {
+                let p = agent::AgentProcess::start(name, bus_socket).await?;
+                Ok(Self::Claude(p))
+            }
+            AgentRuntime::Acp => {
+                let p = acp::AcpProcess::start(name, bus_socket).await?;
+                Ok(Self::Acp(p))
+            }
+        }
+    }
+
+    async fn start_fresh(name: &str, bus_socket: &str, runtime: &AgentRuntime) -> Result<Self> {
+        match runtime {
+            AgentRuntime::Claude => {
+                let p = agent::AgentProcess::start_fresh(name, bus_socket).await?;
+                Ok(Self::Claude(p))
+            }
+            AgentRuntime::Acp => {
+                let p = acp::AcpProcess::start_fresh(name, bus_socket).await?;
+                Ok(Self::Acp(p))
+            }
+        }
+    }
+
+    async fn send_task(
+        &self,
+        message: &str,
+        progress_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+        image: Option<(&str, &str)>,
+        limits: &agent::TaskLimits,
+    ) -> Result<agent::TurnResult> {
+        match self {
+            Self::Claude(p) => p.send_task(message, progress_tx, image, limits).await,
+            Self::Acp(p) => {
+                // ACP doesn't support image content — include note if image was provided.
+                let effective_message = if image.is_some() {
+                    format!(
+                        "[Note: image attachment not supported via ACP]\n{}",
+                        message
+                    )
+                } else {
+                    message.to_string()
+                };
+                p.send_task(&effective_message, progress_tx, limits).await
+            }
+        }
+    }
+
+    fn inject_message(&self, message: &str) -> Result<()> {
+        match self {
+            Self::Claude(p) => p.inject_message(message),
+            Self::Acp(_) => {
+                // ACP doesn't support mid-task message injection.
+                warn!("ACP runtime does not support mid-task message injection");
+                Ok(())
+            }
+        }
+    }
+
+    async fn stop(&self) {
+        match self {
+            Self::Claude(p) => p.stop().await,
+            Self::Acp(p) => p.stop().await,
+        }
+    }
+}
 
 /// Connect to the bus, register, and return the stream.
 ///
@@ -129,9 +206,10 @@ pub async fn run(
     let mut lines = BufReader::new(reader).lines();
     let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
 
-    // Start persistent Claude process (reused across tasks).
+    // Start persistent agent process (reused across tasks).
     let effective_bus = bus_socket.as_deref().unwrap_or(socket_path).to_string();
-    let mut process = agent::AgentProcess::start(name, &effective_bus).await?;
+    let agent_runtime = initial_state.config.runtime.clone();
+    let mut process = RuntimeProcess::start(name, &effective_bus, &agent_runtime).await?;
 
     // Build task limits from agent config — enforced in real-time during tasks.
     let limits = agent::TaskLimits {
@@ -143,7 +221,7 @@ pub async fn run(
         budget_usd: Some(budget_usd),
     };
 
-    info!(agent = %name, "persistent process ready, waiting for tasks");
+    info!(agent = %name, runtime = ?agent_runtime, "agent process ready, waiting for tasks");
 
     while let Some(line) = lines.next_line().await? {
         if line.is_empty() {
@@ -223,7 +301,7 @@ pub async fn run(
         if needs_fresh {
             info!(agent = %name, fresh = msg.metadata.fresh, "fresh session requested, restarting process");
             process.stop().await;
-            process = agent::AgentProcess::start_fresh(name, &effective_bus).await?;
+            process = RuntimeProcess::start_fresh(name, &effective_bus, &agent_runtime).await?;
         }
 
         // Extract optional image data from payload (sent by Telegram adapter for photos).
@@ -504,16 +582,15 @@ pub async fn run(
                 warn!(agent = %name, error = %err_str, "task failed");
 
                 // If the persistent process died, try to restart it.
-                if err_str.contains("persistent process exited") || err_str.contains("stdin closed")
-                {
-                    warn!(agent = %name, "persistent process crashed, restarting");
-                    match agent::AgentProcess::start(name, &effective_bus).await {
+                if err_str.contains("process exited") || err_str.contains("stdin closed") {
+                    warn!(agent = %name, "agent process crashed, restarting");
+                    match RuntimeProcess::start(name, &effective_bus, &agent_runtime).await {
                         Ok(new_proc) => {
                             process = new_proc;
-                            info!(agent = %name, "persistent process restarted");
+                            info!(agent = %name, "agent process restarted");
                         }
                         Err(re) => {
-                            warn!(agent = %name, error = %re, "failed to restart persistent process");
+                            warn!(agent = %name, error = %re, "failed to restart agent process");
                         }
                     }
                 }

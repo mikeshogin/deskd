@@ -149,6 +149,9 @@ pub struct AgentDef {
     /// Container config. When set, the agent process runs inside a container.
     #[serde(default)]
     pub container: Option<ContainerConfig>,
+    /// Agent runtime protocol: claude (default) or acp.
+    #[serde(default)]
+    pub runtime: AgentRuntime,
 }
 
 impl AgentDef {
@@ -248,6 +251,17 @@ pub enum SessionMode {
     Ephemeral,
 }
 
+/// Agent runtime protocol: claude (default) or acp.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentRuntime {
+    /// Claude stream-json protocol (default).
+    #[default]
+    Claude,
+    /// Agent Client Protocol (ACP) — JSON-RPC 2.0 over stdin/stdout.
+    Acp,
+}
+
 /// A sub-agent running within a parent agent's bus scope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubAgentDef {
@@ -265,6 +279,9 @@ pub struct SubAgentDef {
     /// Ephemeral agents start a fresh session for each task.
     #[serde(default)]
     pub session: SessionMode,
+    /// Agent runtime protocol: claude (default) or acp.
+    #[serde(default)]
+    pub runtime: AgentRuntime,
 }
 
 /// Telegram channel routing config in the per-user deskd.yaml.
@@ -525,6 +542,7 @@ agents:
             command: vec!["claude".into()],
             budget_usd: 50.0,
             container: None,
+            runtime: AgentRuntime::default(),
         };
         assert_eq!(def.bus_socket(), "/home/kira/.deskd/bus.sock");
         assert_eq!(def.config_path(), "/home/kira/deskd.yaml");
@@ -543,6 +561,7 @@ agents:
             command: vec!["claude".into()],
             budget_usd: 50.0,
             container: None,
+            runtime: AgentRuntime::default(),
         };
         assert_eq!(def.config_path(), "/etc/agents/kira.yaml");
     }
@@ -651,6 +670,7 @@ agents:
                 subscribe: vec!["agent:dev".into()],
                 publish: None,
                 session: SessionMode::default(),
+                runtime: AgentRuntime::default(),
             }],
             telegram: Some(TelegramRoutesConfig {
                 routes: vec![TelegramRoute {
