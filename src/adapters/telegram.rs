@@ -293,11 +293,20 @@ async fn bus_loop(
                 continue;
             }
 
+            // Prepend timestamp and source so the user can orient by agent time.
+            let source = msg.get("source").and_then(|s| s.as_str()).unwrap_or("");
+            let now = chrono::Local::now().format("%H:%M");
+            let text = if source.is_empty() {
+                format!("[{now}]\n{text}")
+            } else {
+                format!("[{now} · {source}]\n{text}")
+            };
+
             debug!(chat_id = chat_id, "forwarding bus message to Telegram");
             if outbound_tx
                 .send(OutboundCmd::Text {
                     chat_id,
-                    text: text.to_string(),
+                    text,
                 })
                 .is_err()
             {
