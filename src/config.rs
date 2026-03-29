@@ -1,3 +1,4 @@
+use crate::context::ContextConfig;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -219,6 +220,9 @@ pub struct UserConfig {
     /// State machine model definitions.
     #[serde(default)]
     pub models: Vec<ModelDef>,
+    /// Context system configuration (main branch, compaction).
+    #[serde(default)]
+    pub context: Option<ContextConfig>,
 }
 
 fn default_model() -> String {
@@ -660,6 +664,7 @@ agents:
             schedules: vec![],
             mcp_config: None,
             models: vec![],
+            context: None,
         };
         let desc = cfg.send_message_description("kira");
         assert!(desc.contains("agent:dev"));

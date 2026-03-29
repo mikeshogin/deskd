@@ -2,6 +2,7 @@ mod adapters;
 mod agent;
 mod bus;
 mod config;
+pub mod context;
 mod inbox;
 mod mcp;
 mod message;
