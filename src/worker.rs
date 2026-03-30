@@ -379,7 +379,15 @@ pub async fn run(
                     .and_then(|v| v.as_str())
                     .map(|n| format!("{} ({})", n, chat_id))
                     .unwrap_or_else(|| chat_id.to_string());
-                task_owned = format!("[Telegram: {}]\n{}", label, task_raw);
+                let quoted = msg
+                    .payload
+                    .get("telegram_reply_to_text")
+                    .and_then(|v| v.as_str());
+                task_owned = if let Some(q) = quoted {
+                    format!("[Telegram: {}]\n> {}\n\n{}", label, q, task_raw)
+                } else {
+                    format!("[Telegram: {}]\n{}", label, task_raw)
+                };
                 &task_owned as &str
             } else {
                 // Non-Telegram sources: tag with source so agent can distinguish

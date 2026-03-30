@@ -633,9 +633,12 @@ async fn polling_loop(
                 });
                 let message_id = msg.id.0;
                 let reply_to_message_id = msg.reply_to_message().map(|r| r.id.0);
+                let reply_to_text = msg
+                    .reply_to_message()
+                    .and_then(|r| r.text().or_else(|| r.caption()).map(|s| s.to_string()));
 
                 if let Err(e) =
-                    publish_to_bus(&socket, &agent, &text, &target, &reply_to, chat_id, chat_name, image_base64.as_deref(), sender_info.as_ref(), message_id, reply_to_message_id)
+                    publish_to_bus(&socket, &agent, &text, &target, &reply_to, chat_id, chat_name, image_base64.as_deref(), sender_info.as_ref(), message_id, reply_to_message_id, reply_to_text.as_deref())
                         .await
                 {
                     warn!(chat_id = chat_id, error = %e, "failed to publish message to bus");
@@ -742,6 +745,7 @@ async fn publish_to_bus(
     sender_info: Option<&SenderInfo>,
     message_id: i32,
     reply_to_message_id: Option<i32>,
+    reply_to_text: Option<&str>,
 ) -> Result<()> {
     let mut stream = UnixStream::connect(socket_path)
         .await
@@ -766,6 +770,10 @@ async fn publish_to_bus(
 
     if let Some(reply_id) = reply_to_message_id {
         payload["telegram_reply_to_message_id"] = serde_json::json!(reply_id);
+    }
+
+    if let Some(quoted) = reply_to_text {
+        payload["telegram_reply_to_text"] = serde_json::Value::String(quoted.to_string());
     }
 
     if let Some(sender) = sender_info {
