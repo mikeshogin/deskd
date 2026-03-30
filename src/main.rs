@@ -98,6 +98,22 @@ enum Commands {
         #[command(subcommand)]
         action: SmAction,
     },
+    /// Manage cron schedules in the agent's deskd.yaml.
+    ///
+    /// List, add, or remove scheduled actions without editing YAML manually.
+    /// Operates on `./deskd.yaml` by default (override with --config).
+    ///
+    /// Examples:
+    ///   deskd schedule list
+    ///   deskd schedule add --cron "0 */5 * * * *" --action github_poll --target "agent:dev"
+    ///   deskd schedule rm 0
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleSubcommand,
+        /// Path to deskd.yaml (default: ./deskd.yaml).
+        #[arg(long, global = true, default_value = "./deskd.yaml")]
+        config: String,
+    },
     /// Schedule a one-shot reminder for an agent.
     ///
     /// Writes a RemindDef JSON to ~/.deskd/reminders/<uuid>.json.
@@ -283,6 +299,32 @@ enum GraphAction {
     Validate {
         /// Path to the graph YAML file.
         file: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScheduleSubcommand {
+    /// List all schedules with cron, action, target, and next fire time.
+    List,
+    /// Add a new schedule.
+    Add {
+        /// Cron expression (6-field: sec min hour day month weekday).
+        #[arg(long)]
+        cron: String,
+        /// Action type: github_poll, raw, or shell.
+        #[arg(long)]
+        action: String,
+        /// Bus target (e.g. agent:dev).
+        #[arg(long)]
+        target: String,
+        /// Action config as JSON string (e.g. '{"repos":["kgatilin/deskd"]}').
+        #[arg(long)]
+        config_json: Option<String>,
+    },
+    /// Remove a schedule by index (as shown in `list`).
+    Rm {
+        /// Schedule index (0-based).
+        index: usize,
     },
 }
 
@@ -707,6 +749,12 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let user_cfg = config::UserConfig::load(&config_path)?;
             handle_sm(action, &user_cfg)?;
+        }
+        Commands::Schedule {
+            action,
+            config: config_path,
+        } => {
+            handle_schedule(action, &config_path)?;
         }
         Commands::Remind {
             name,
@@ -1269,6 +1317,111 @@ fn parse_duration_secs(s: &str) -> anyhow::Result<u64> {
     Ok(total)
 }
 
+/// Handle `deskd schedule {list,add,rm}`.
+fn handle_schedule(action: ScheduleSubcommand, config_path: &str) -> anyhow::Result<()> {
+    match action {
+        ScheduleSubcommand::List => {
+            let user_cfg = config::UserConfig::load(config_path)?;
+            if user_cfg.schedules.is_empty() {
+                println!("No schedules defined in {}", config_path);
+                return Ok(());
+            }
+            println!(
+                "{:<3} {:<20} {:<14} {:<26} NEXT",
+                "#", "CRON", "ACTION", "TARGET"
+            );
+            println!("{}", "─".repeat(70));
+            for (i, sched) in user_cfg.schedules.iter().enumerate() {
+                let action_label = format!("{:?}", sched.action).to_lowercase();
+                let next = cron::Schedule::from_str(&sched.cron)
+                    .ok()
+                    .and_then(|s| s.upcoming(chrono::Utc).next())
+                    .map(|t| {
+                        let dur = t - chrono::Utc::now();
+                        format_relative_time(dur)
+                    })
+                    .unwrap_or_else(|| "?".to_string());
+                println!(
+                    "{:<3} {:<20} {:<14} {:<26} next {}",
+                    i, sched.cron, action_label, sched.target, next
+                );
+            }
+        }
+        ScheduleSubcommand::Add {
+            cron: cron_expr,
+            action,
+            target,
+            config_json,
+        } => {
+            // Validate cron expression.
+            cron::Schedule::from_str(&cron_expr)
+                .map_err(|e| anyhow::anyhow!("invalid cron expression: {}", e))?;
+
+            // Parse action string.
+            let schedule_action: config::ScheduleAction =
+                serde_yaml::from_str(&format!("\"{}\"", action))
+                    .map_err(|_| anyhow::anyhow!("invalid action: {} (expected: github_poll, raw, shell)", action))?;
+
+            // Parse optional config JSON to YAML value.
+            let config_val = match config_json {
+                Some(json) => {
+                    let v: serde_json::Value = serde_json::from_str(&json)
+                        .map_err(|e| anyhow::anyhow!("invalid --config-json: {}", e))?;
+                    let yaml_str = serde_json::to_string(&v)?;
+                    Some(serde_yaml::from_str(&yaml_str)?)
+                }
+                None => None,
+            };
+
+            let new_sched = config::ScheduleDef {
+                cron: cron_expr.clone(),
+                target: target.clone(),
+                action: schedule_action,
+                config: config_val,
+            };
+
+            // Load, append, write back.
+            let raw = std::fs::read_to_string(config_path)
+                .with_context(|| format!("failed to read {}", config_path))?;
+            let mut user_cfg: config::UserConfig =
+                serde_yaml::from_str(&raw).context("failed to parse config")?;
+            user_cfg.schedules.push(new_sched);
+            let out = serde_yaml::to_string(&user_cfg)?;
+            std::fs::write(config_path, &out)
+                .with_context(|| format!("failed to write {}", config_path))?;
+
+            let idx = user_cfg.schedules.len() - 1;
+            println!("Added schedule #{}: {} {} → {}", idx, cron_expr, action, target);
+        }
+        ScheduleSubcommand::Rm { index } => {
+            let raw = std::fs::read_to_string(config_path)
+                .with_context(|| format!("failed to read {}", config_path))?;
+            let mut user_cfg: config::UserConfig =
+                serde_yaml::from_str(&raw).context("failed to parse config")?;
+
+            if index >= user_cfg.schedules.len() {
+                anyhow::bail!(
+                    "index {} out of range (have {} schedules)",
+                    index,
+                    user_cfg.schedules.len()
+                );
+            }
+
+            let removed = user_cfg.schedules.remove(index);
+            let out = serde_yaml::to_string(&user_cfg)?;
+            std::fs::write(config_path, &out)
+                .with_context(|| format!("failed to write {}", config_path))?;
+
+            let action_label = format!("{:?}", removed.action).to_lowercase();
+            println!(
+                "Removed schedule #{}: {} {} → {}",
+                index, removed.cron, action_label, removed.target
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Handle `deskd remind <name> [--in <dur> | --at <ts>] [--target <t>] "<message>"`.
 fn handle_remind(
     name: String,
@@ -1639,5 +1792,115 @@ mod tests {
 
         // Cleanup.
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_schedule_list_parses_config() {
+        let tmp = std::env::temp_dir().join(format!(
+            "deskd-test-sched-list-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cfg_path = tmp.join("deskd.yaml");
+        std::fs::write(
+            &cfg_path,
+            r#"
+model: claude-sonnet-4-6
+schedules:
+  - cron: "0 */5 * * * *"
+    target: "agent:dev"
+    action: github_poll
+    config:
+      repos:
+        - kgatilin/deskd
+  - cron: "0 0 9 * * *"
+    target: "agent:dev"
+    action: raw
+    config: "Morning brief"
+"#,
+        )
+        .unwrap();
+
+        let user_cfg = config::UserConfig::load(cfg_path.to_str().unwrap()).unwrap();
+        assert_eq!(user_cfg.schedules.len(), 2);
+        assert_eq!(user_cfg.schedules[0].cron, "0 */5 * * * *");
+        assert_eq!(user_cfg.schedules[0].target, "agent:dev");
+        assert_eq!(user_cfg.schedules[1].cron, "0 0 9 * * *");
+
+        // Verify list handler runs without error.
+        handle_schedule(
+            ScheduleSubcommand::List,
+            cfg_path.to_str().unwrap(),
+        )
+        .unwrap();
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_schedule_add_rm_roundtrip() {
+        let tmp = std::env::temp_dir().join(format!(
+            "deskd-test-sched-addm-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cfg_path = tmp.join("deskd.yaml");
+        std::fs::write(
+            &cfg_path,
+            "model: claude-sonnet-4-6\nschedules: []\n",
+        )
+        .unwrap();
+
+        let path_str = cfg_path.to_str().unwrap();
+
+        // Add a schedule.
+        handle_schedule(
+            ScheduleSubcommand::Add {
+                cron: "0 0 9 * * *".to_string(),
+                action: "raw".to_string(),
+                target: "agent:dev".to_string(),
+                config_json: None,
+            },
+            path_str,
+        )
+        .unwrap();
+
+        let cfg = config::UserConfig::load(path_str).unwrap();
+        assert_eq!(cfg.schedules.len(), 1);
+        assert_eq!(cfg.schedules[0].cron, "0 0 9 * * *");
+        assert_eq!(cfg.schedules[0].target, "agent:dev");
+
+        // Add another.
+        handle_schedule(
+            ScheduleSubcommand::Add {
+                cron: "0 */5 * * * *".to_string(),
+                action: "github_poll".to_string(),
+                target: "agent:collab".to_string(),
+                config_json: Some(r#"{"repos":["kgatilin/deskd"]}"#.to_string()),
+            },
+            path_str,
+        )
+        .unwrap();
+
+        let cfg = config::UserConfig::load(path_str).unwrap();
+        assert_eq!(cfg.schedules.len(), 2);
+
+        // Remove the first.
+        handle_schedule(ScheduleSubcommand::Rm { index: 0 }, path_str).unwrap();
+
+        let cfg = config::UserConfig::load(path_str).unwrap();
+        assert_eq!(cfg.schedules.len(), 1);
+        assert_eq!(cfg.schedules[0].cron, "0 */5 * * * *");
+
+        // Remove out-of-range should fail.
+        assert!(handle_schedule(ScheduleSubcommand::Rm { index: 5 }, path_str).is_err());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
