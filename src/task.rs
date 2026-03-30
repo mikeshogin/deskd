@@ -66,6 +66,9 @@ pub struct Task {
     /// Who created the task.
     #[serde(default)]
     pub created_by: String,
+    /// Linked state machine instance ID (set when task is created by SM dispatch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sm_instance_id: Option<String>,
 }
 
 /// Persistent store for tasks, backed by a directory of JSON files.
@@ -113,6 +116,32 @@ impl TaskStore {
         criteria: TaskCriteria,
         created_by: &str,
     ) -> Result<Task> {
+        self.create_inner(description, criteria, created_by, None)
+    }
+
+    /// Create a new task linked to a state machine instance.
+    pub fn create_for_sm(
+        &self,
+        description: &str,
+        criteria: TaskCriteria,
+        created_by: &str,
+        sm_instance_id: &str,
+    ) -> Result<Task> {
+        self.create_inner(
+            description,
+            criteria,
+            created_by,
+            Some(sm_instance_id.to_string()),
+        )
+    }
+
+    fn create_inner(
+        &self,
+        description: &str,
+        criteria: TaskCriteria,
+        created_by: &str,
+        sm_instance_id: Option<String>,
+    ) -> Result<Task> {
         let id = format!("task-{}", &uuid::Uuid::new_v4().to_string()[..8]);
         let now = Utc::now().to_rfc3339();
 
@@ -127,6 +156,7 @@ impl TaskStore {
             created_at: now.clone(),
             updated_at: now,
             created_by: created_by.to_string(),
+            sm_instance_id,
         };
 
         self.save(&task)?;

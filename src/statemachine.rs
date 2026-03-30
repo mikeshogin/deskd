@@ -250,6 +250,7 @@ mod tests {
                     notify: None,
                     timeout: None,
                     timeout_goto: None,
+                    criteria: None,
                 },
                 TransitionDef {
                     from: "in_review".into(),
@@ -262,6 +263,7 @@ mod tests {
                     notify: None,
                     timeout: None,
                     timeout_goto: None,
+                    criteria: None,
                 },
                 TransitionDef {
                     from: "in_review".into(),
@@ -274,6 +276,7 @@ mod tests {
                     notify: None,
                     timeout: None,
                     timeout_goto: None,
+                    criteria: None,
                 },
                 TransitionDef {
                     from: "*".into(),
@@ -286,6 +289,7 @@ mod tests {
                     notify: None,
                     timeout: None,
                     timeout_goto: None,
+                    criteria: None,
                 },
             ],
         }

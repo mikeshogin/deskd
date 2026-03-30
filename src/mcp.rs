@@ -974,6 +974,7 @@ async fn call_task_list(args: &Value) -> Result<Value> {
                 "assignee": t.assignee,
                 "created_by": t.created_by,
                 "created_at": t.created_at,
+                "sm_instance_id": t.sm_instance_id,
             })
         })
         .collect();

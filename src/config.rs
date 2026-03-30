@@ -369,6 +369,10 @@ pub struct TransitionDef {
     pub timeout: Option<String>,
     #[serde(default)]
     pub timeout_goto: Option<String>,
+    /// Task queue criteria for this transition (model, labels).
+    /// When set, dispatch creates a task in the queue instead of direct bus message.
+    #[serde(default)]
+    pub criteria: Option<crate::task::TaskCriteria>,
 }
 
 impl UserConfig {
