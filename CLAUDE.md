@@ -2,7 +2,7 @@
 
 Lightweight runtime for managing AI agents. Spawn agents, route messages, track costs.
 
-Repo: github.com/kgatilin/deskd (public, MIT). Part of the Nassau ecosystem.
+Repo: github.com/kgatilin/deskd (public, MIT).
 
 ## Architecture
 

@@ -4,8 +4,6 @@
 
 Spawn, route, and manage AI agents. Each agent gets its own isolated message bus (Unix socket), persistent session, and worker loop. Agents communicate via pub/sub routing; adapters bridge external platforms (Telegram, Discord). Skill graphs encode multi-step workflows as executable DAGs.
 
-Part of the [Nassau ecosystem](https://github.com/kgatilin/nassau).
-
 ---
 
 ## Quick Start
@@ -187,7 +185,6 @@ cargo fmt && cargo clippy -- -D warnings && cargo test
 
 ---
 
-## Governance
+## License
 
-Developed under the [Nassau collaboration rules](https://github.com/kgatilin/nassau).
-License: MIT
+MIT
