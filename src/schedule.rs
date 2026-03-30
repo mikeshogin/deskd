@@ -232,15 +232,26 @@ async fn fire_github_poll(
     let mut since_state = load_since_state(home_dir);
 
     for repo in &repos {
-        let since = since_state.get(repo).cloned().unwrap_or_else(|| {
+        let fresh_since = || {
             (Utc::now() - chrono::Duration::minutes(5))
                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-        });
+        };
+        // Fall back to the legacy bare-repo key for backward compatibility with
+        // since-state files written before per-event-type tracking.
+        let legacy_since = since_state.get(repo).cloned();
+        let default_since = || legacy_since.clone().unwrap_or_else(&fresh_since);
 
         let mut count = 0;
-        let mut had_error = false;
+
+        // Each event type tracks its own since timestamp so a failure in one
+        // (e.g. pull_requests) does not prevent the others from advancing.
 
         if events.contains(&"issues".to_string()) {
+            let key = format!("{}:issues", repo);
+            let since = since_state
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(&default_since);
             match poll_issues(
                 repo,
                 label,
@@ -252,15 +263,25 @@ async fn fire_github_poll(
             )
             .await
             {
-                Ok(n) => count += n,
+                Ok(n) => {
+                    count += n;
+                    since_state.insert(
+                        key,
+                        Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    );
+                }
                 Err(e) => {
                     warn!(agent = %agent_name, repo = %repo, error = %e, "github_poll issues failed");
-                    had_error = true;
                 }
             }
         }
 
         if events.contains(&"issue_comments".to_string()) {
+            let key = format!("{}:issue_comments", repo);
+            let since = since_state
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(&default_since);
             match poll_issue_comments(
                 repo,
                 &since,
@@ -271,15 +292,25 @@ async fn fire_github_poll(
             )
             .await
             {
-                Ok(n) => count += n,
+                Ok(n) => {
+                    count += n;
+                    since_state.insert(
+                        key,
+                        Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    );
+                }
                 Err(e) => {
                     warn!(agent = %agent_name, repo = %repo, error = %e, "github_poll issue_comments failed");
-                    had_error = true;
                 }
             }
         }
 
         if events.contains(&"pull_requests".to_string()) {
+            let key = format!("{}:pull_requests", repo);
+            let since = since_state
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(&default_since);
             match poll_pull_requests(
                 repo,
                 &since,
@@ -290,20 +321,17 @@ async fn fire_github_poll(
             )
             .await
             {
-                Ok(n) => count += n,
+                Ok(n) => {
+                    count += n;
+                    since_state.insert(
+                        key,
+                        Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    );
+                }
                 Err(e) => {
                     warn!(agent = %agent_name, repo = %repo, error = %e, "github_poll pull_requests failed");
-                    had_error = true;
                 }
             }
-        }
-
-        // Only update since timestamp if all polls succeeded — otherwise retry next cycle.
-        if !had_error {
-            since_state.insert(
-                repo.clone(),
-                Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            );
         }
 
         if count > 0 {
@@ -970,6 +998,45 @@ mod tests {
         // We use a dummy bus_socket since target is empty and output won't be sent
         let result = fire_shell(&def, "/tmp/nonexistent.sock", "test-agent", &home_dir).await;
         assert!(result.is_ok(), "fire_shell should succeed: {:?}", result);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_since_state_per_event_type_keys() {
+        let dir = std::env::temp_dir().join("deskd_test_since_event_keys");
+        let _ = std::fs::remove_dir_all(&dir);
+        let home_dir = dir.to_string_lossy().to_string();
+
+        let mut state = HashMap::new();
+        state.insert(
+            "owner/repo:issues".to_string(),
+            "2026-03-27T10:00:00Z".to_string(),
+        );
+        state.insert(
+            "owner/repo:issue_comments".to_string(),
+            "2026-03-27T10:05:00Z".to_string(),
+        );
+        state.insert(
+            "owner/repo:pull_requests".to_string(),
+            "2026-03-27T09:55:00Z".to_string(),
+        );
+
+        save_since_state(&home_dir, &state);
+        let loaded = load_since_state(&home_dir);
+
+        assert_eq!(
+            loaded.get("owner/repo:issues").unwrap(),
+            "2026-03-27T10:00:00Z"
+        );
+        assert_eq!(
+            loaded.get("owner/repo:issue_comments").unwrap(),
+            "2026-03-27T10:05:00Z"
+        );
+        assert_eq!(
+            loaded.get("owner/repo:pull_requests").unwrap(),
+            "2026-03-27T09:55:00Z"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
