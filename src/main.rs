@@ -1401,13 +1401,17 @@ fn handle_task(action: TaskAction) -> anyhow::Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<14} {:<10} {:<14} DESCRIPTION",
-                "ID", "STATUS", "ASSIGNEE"
+                "{:<14} {:<10} {:<14} {:<14} DESCRIPTION",
+                "ID", "STATUS", "ASSIGNEE", "SM"
             );
             for t in &tasks {
                 let assignee = t.assignee.as_deref().unwrap_or("-");
-                let desc = truncate_main(&t.description, 60);
-                println!("{:<14} {:<10} {:<14} {}", t.id, t.status, assignee, desc);
+                let sm = t.sm_instance_id.as_deref().unwrap_or("-");
+                let desc = truncate_main(&t.description, 50);
+                println!(
+                    "{:<14} {:<10} {:<14} {:<14} {}",
+                    t.id, t.status, assignee, sm, desc
+                );
             }
         }
         TaskAction::Cancel { id } => {

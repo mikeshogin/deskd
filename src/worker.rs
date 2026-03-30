@@ -252,12 +252,19 @@ pub async fn run(
                         "claimed task from queue"
                     );
                     // Synthesize a bus message from the claimed task.
+                    let mut payload = serde_json::json!({
+                        "task": task.description,
+                        "task_queue_id": task.id,
+                    });
+                    if let Some(ref sm_id) = task.sm_instance_id {
+                        payload["sm_instance_id"] = serde_json::json!(sm_id);
+                    }
                     let synthetic = serde_json::json!({
                         "type": "message",
                         "id": format!("queue-{}", task.id),
                         "source": format!("task-queue:{}", task.created_by),
                         "target": format!("agent:{}", name),
-                        "payload": {"task": task.description, "task_queue_id": task.id},
+                        "payload": payload,
                     });
                     serde_json::to_string(&synthetic).unwrap_or_default()
                 } else {

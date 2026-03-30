@@ -219,6 +219,22 @@ async fn dispatch_instance(
     // Build task text with prompt injection.
     let task_text = build_task_text(&prompt, inst);
 
+    // Check if the transition has task queue criteria — dispatch via queue if so.
+    let transition_criteria = transition_def.and_then(|t| t.criteria.clone());
+
+    if let Some(criteria) = transition_criteria {
+        // Dispatch via task queue (pull-based).
+        let store = crate::task::TaskStore::default_for_home();
+        let task = store.create_for_sm(&task_text, criteria, "workflow-engine", &inst.id)?;
+        info!(
+            instance = %inst.id,
+            task_id = %task.id,
+            "task created in queue for SM dispatch"
+        );
+        return Ok(());
+    }
+
+    // Fallback: direct bus message dispatch (no criteria = legacy behavior).
     let msg = serde_json::json!({
         "type": "message",
         "id": Uuid::new_v4().to_string(),
@@ -237,7 +253,7 @@ async fn dispatch_instance(
     let mut w = writer.lock().await;
     w.write_all(line.as_bytes()).await?;
 
-    info!(instance = %inst.id, assignee = %inst.assignee, "task dispatched");
+    info!(instance = %inst.id, assignee = %inst.assignee, "task dispatched via bus");
     Ok(())
 }
 
@@ -325,6 +341,7 @@ mod tests {
                     notify: None,
                     timeout: None,
                     timeout_goto: None,
+                    criteria: None,
                 },
                 TransitionDef {
                     from: "review".into(),
@@ -337,6 +354,7 @@ mod tests {
                     notify: None,
                     timeout: None,
                     timeout_goto: None,
+                    criteria: None,
                 },
                 TransitionDef {
                     from: "review".into(),
@@ -349,6 +367,7 @@ mod tests {
                     notify: None,
                     timeout: None,
                     timeout_goto: None,
+                    criteria: None,
                 },
             ],
         }
@@ -416,6 +435,7 @@ mod tests {
                     notify: None,
                     timeout: None,
                     timeout_goto: None,
+                    criteria: None,
                 },
                 TransitionDef {
                     from: "a".into(),
@@ -428,6 +448,7 @@ mod tests {
                     notify: None,
                     timeout: None,
                     timeout_goto: None,
+                    criteria: None,
                 },
             ],
         };
@@ -483,5 +504,177 @@ mod tests {
         };
         let text = build_task_text("", &inst);
         assert!(text.contains("Previous output here"));
+    }
+
+    fn queue_dispatch_model() -> ModelDef {
+        ModelDef {
+            name: "feature".into(),
+            description: "Feature pipeline with queue dispatch".into(),
+            states: vec![
+                "backlog".into(),
+                "planning".into(),
+                "implementing".into(),
+                "done".into(),
+            ],
+            initial: "backlog".into(),
+            terminal: vec!["done".into()],
+            transitions: vec![
+                TransitionDef {
+                    from: "backlog".into(),
+                    to: "planning".into(),
+                    trigger: Some("start".into()),
+                    on: None,
+                    assignee: Some("agent:planner".into()),
+                    prompt: Some("Create a plan.".into()),
+                    step_type: None,
+                    notify: None,
+                    timeout: None,
+                    timeout_goto: None,
+                    criteria: Some(crate::task::TaskCriteria {
+                        model: Some("claude-sonnet-4-6".into()),
+                        labels: vec!["planning".into()],
+                    }),
+                },
+                TransitionDef {
+                    from: "planning".into(),
+                    to: "implementing".into(),
+                    trigger: Some("auto".into()),
+                    on: None,
+                    assignee: Some("agent:dev".into()),
+                    prompt: Some("Implement the plan.".into()),
+                    step_type: None,
+                    notify: None,
+                    timeout: None,
+                    timeout_goto: None,
+                    criteria: Some(crate::task::TaskCriteria {
+                        model: Some("claude-sonnet-4-6".into()),
+                        labels: vec![],
+                    }),
+                },
+                TransitionDef {
+                    from: "implementing".into(),
+                    to: "done".into(),
+                    trigger: Some("auto".into()),
+                    on: None,
+                    assignee: None,
+                    prompt: None,
+                    step_type: None,
+                    notify: None,
+                    timeout: None,
+                    timeout_goto: None,
+                    criteria: None,
+                },
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sm_dispatch_creates_task_in_queue() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sm_dir = std::path::PathBuf::from(format!("/tmp/deskd_sm_queue_test_{}", ts));
+        let task_dir = std::path::PathBuf::from(format!("/tmp/deskd_task_queue_test_{}", ts));
+
+        let sm_store = statemachine::StateMachineStore::new(sm_dir.clone());
+        let task_store = crate::task::TaskStore::new(task_dir.clone());
+        let model = queue_dispatch_model();
+
+        // Create SM instance.
+        let inst = sm_store
+            .create(&model, "FEAT-100", "Build widget", "kira")
+            .unwrap();
+        assert_eq!(inst.state, "backlog");
+
+        // Move to planning — this transition has criteria.
+        let mut inst = inst;
+        sm_store
+            .move_to(&mut inst, &model, "planning", "start", None)
+            .unwrap();
+        assert_eq!(inst.state, "planning");
+        assert_eq!(inst.assignee, "agent:planner");
+
+        // Simulate dispatch — create task via TaskStore (same as dispatch_instance with criteria).
+        let transition = model
+            .transitions
+            .iter()
+            .find(|t| t.to == "planning")
+            .unwrap();
+        let criteria = transition.criteria.clone().unwrap();
+        let task_text = build_task_text(transition.prompt.as_deref().unwrap_or(""), &inst);
+        let task = task_store
+            .create_for_sm(&task_text, criteria, "workflow-engine", &inst.id)
+            .unwrap();
+
+        // Verify task was created with correct sm_instance_id.
+        assert_eq!(task.sm_instance_id.as_deref(), Some(inst.id.as_str()));
+        assert_eq!(task.status, crate::task::TaskStatus::Pending);
+        assert!(task.description.contains("Create a plan."));
+        assert!(task.description.contains("FEAT-100"));
+
+        // Verify task list shows the SM-linked task.
+        let all = task_store.list(None).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].sm_instance_id.as_deref(), Some(inst.id.as_str()));
+
+        // Simulate completion — handle_completion applies auto transition.
+        inst.result = Some("Plan: implement X, Y, Z".into());
+        inst.updated_at = chrono::Utc::now().to_rfc3339();
+        sm_store.save(&inst).unwrap();
+
+        let target = find_next_state(&model, "planning", "Plan: implement X, Y, Z");
+        assert_eq!(target, Some("implementing".into()));
+
+        // Apply the transition.
+        sm_store
+            .move_to(
+                &mut inst,
+                &model,
+                "implementing",
+                "auto",
+                Some("Plan: implement X, Y, Z"),
+            )
+            .unwrap();
+        assert_eq!(inst.state, "implementing");
+
+        // The implementing transition also has criteria — would create another task.
+        let impl_transition = model
+            .transitions
+            .iter()
+            .find(|t| t.to == "implementing")
+            .unwrap();
+        assert!(impl_transition.criteria.is_some());
+
+        let task2 = task_store
+            .create_for_sm(
+                &build_task_text(impl_transition.prompt.as_deref().unwrap_or(""), &inst),
+                impl_transition.criteria.clone().unwrap(),
+                "workflow-engine",
+                &inst.id,
+            )
+            .unwrap();
+        assert_eq!(task2.sm_instance_id.as_deref(), Some(inst.id.as_str()));
+        assert!(task2.description.contains("Implement the plan."));
+
+        // After implementing, auto goes to done (terminal).
+        let final_target = find_next_state(&model, "implementing", "Done: all implemented");
+        assert_eq!(final_target, Some("done".into()));
+        sm_store
+            .move_to(&mut inst, &model, "done", "auto", None)
+            .unwrap();
+        assert!(statemachine::is_terminal(&model, &inst));
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&sm_dir);
+        let _ = std::fs::remove_dir_all(&task_dir);
+    }
+
+    #[test]
+    fn test_dispatch_without_criteria_uses_bus() {
+        // Transitions without criteria should NOT use task queue.
+        let model = test_model();
+        let transition = model.transitions.iter().find(|t| t.to == "review").unwrap();
+        assert!(transition.criteria.is_none());
     }
 }
