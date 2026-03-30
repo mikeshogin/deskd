@@ -37,12 +37,21 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # Build archlint-rs from source
+      # Resolve latest archlint-rs commit SHA so the cache key tracks upstream.
+      # This ensures the binary is rebuilt when archlint main advances,
+      # fixing the stale binary issue that caused Components: 0.
+      - name: Get archlint-rs HEAD SHA
+        id: archlint_sha
+        run: |
+          SHA=$(git ls-remote https://github.com/mshogin/archlint.git HEAD | cut -f1 | cut -c1-12)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
       - name: Cache archlint-rs
         uses: actions/cache@v4
         with:
           path: /tmp/archlint-rs/target/release/archlint
-          key: archlint-rs-${{ runner.os }}-v1
+          # Cache key includes archlint commit SHA — invalidates on new upstream commits
+          key: archlint-rs-${{ runner.os }}-${{ steps.archlint_sha.outputs.sha }}
 
       - name: Build archlint-rs
         run: |
@@ -63,11 +72,12 @@ jobs:
           echo "## Architecture scan" > /tmp/archlint-report.md
           echo "" >> /tmp/archlint-report.md
 
-          # Full scan with YAML output for machine processing
-          $ARCHLINT scan ./src --format yaml > /tmp/arch.yaml 2>/dev/null || true
+          # Scan project root (not ./src): archlint needs Cargo.toml to resolve
+          # module paths correctly. Passing ./src caused Components: 0.
+          $ARCHLINT scan . --format yaml > /tmp/arch.yaml 2>&1 || true
 
           # Human-readable scan
-          SCAN_OUTPUT=$($ARCHLINT scan ./src 2>/dev/null || true)
+          SCAN_OUTPUT=$($ARCHLINT scan . 2>&1 || true)
 
           # Count components and links
           COMPONENTS=$(grep -c "^  - name:" /tmp/arch.yaml 2>/dev/null || echo "0")
@@ -79,23 +89,38 @@ jobs:
           echo "| Links | $LINKS |" >> /tmp/archlint-report.md
           echo "" >> /tmp/archlint-report.md
 
-          # Run diff if this is a PR (compare with base branch)
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            BASE_SHA=${{ github.event.pull_request.base.sha }}
-            HEAD_SHA=${{ github.event.pull_request.head.sha }}
+          if [ -n "$SCAN_OUTPUT" ]; then
+            echo "### Scan output" >> /tmp/archlint-report.md
+            echo '```' >> /tmp/archlint-report.md
+            echo "$SCAN_OUTPUT" | head -40 >> /tmp/archlint-report.md
+            echo '```' >> /tmp/archlint-report.md
+            echo "" >> /tmp/archlint-report.md
+          fi
 
-            DIFF_OUTPUT=$($ARCHLINT diff $BASE_SHA $HEAD_SHA 2>/dev/null || true)
+          # Architecture diff: compare PR head against merge base using the
+          # FROM..TO ref format expected by `archlint diff`.
+          # Raw SHAs used before caused diff failures on shallow clones.
+          BASE_REF="${{ github.event.pull_request.base.ref }}"
+          git fetch origin "$BASE_REF" 2>/dev/null || true
+          MERGE_BASE=$(git merge-base "origin/$BASE_REF" HEAD 2>/dev/null || echo "")
+
+          if [ -n "$MERGE_BASE" ]; then
+            DIFF_OUTPUT=$($ARCHLINT diff "${MERGE_BASE}..HEAD" 2>&1 || true)
             if [ -n "$DIFF_OUTPUT" ]; then
-              echo "### Architecture diff (base → PR)" >> /tmp/archlint-report.md
+              echo "### Architecture diff (base -> PR)" >> /tmp/archlint-report.md
               echo '```' >> /tmp/archlint-report.md
               echo "$DIFF_OUTPUT" >> /tmp/archlint-report.md
               echo '```' >> /tmp/archlint-report.md
+              echo "" >> /tmp/archlint-report.md
+            else
+              echo "### Architecture diff" >> /tmp/archlint-report.md
+              echo "No architectural changes detected." >> /tmp/archlint-report.md
               echo "" >> /tmp/archlint-report.md
             fi
           fi
 
           # Performance analysis
-          PERF_OUTPUT=$($ARCHLINT perf ./src 2>/dev/null || true)
+          PERF_OUTPUT=$($ARCHLINT perf . 2>&1 || true)
           if [ -n "$PERF_OUTPUT" ]; then
             echo "### Performance analysis" >> /tmp/archlint-report.md
             echo '```' >> /tmp/archlint-report.md
@@ -104,6 +129,9 @@ jobs:
           fi
 
           cat /tmp/archlint-report.md
+
+          # TODO: Remove || true from scan/diff commands when ready to block PRs.
+          # Job currently succeeds regardless of violations (informational only).
 
       # Post results as PR comment
       - name: Comment on PR
