@@ -92,6 +92,7 @@ fn test_model() -> deskd::config::ModelDef {
                 notify: None,
                 timeout: None,
                 timeout_goto: None,
+                criteria: None,
             },
             deskd::config::TransitionDef {
                 from: "review".into(),
@@ -104,6 +105,7 @@ fn test_model() -> deskd::config::ModelDef {
                 notify: None,
                 timeout: None,
                 timeout_goto: None,
+                criteria: None,
             },
             deskd::config::TransitionDef {
                 from: "review".into(),
@@ -116,6 +118,7 @@ fn test_model() -> deskd::config::ModelDef {
                 notify: None,
                 timeout: None,
                 timeout_goto: None,
+                criteria: None,
             },
         ],
     }
