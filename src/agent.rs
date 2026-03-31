@@ -268,6 +268,27 @@ async fn send_inner(
     // Auto-inject required flags for stream-json operation (#151).
     inject_required_flags(&mut args, &state.config.command);
 
+    // Auto-inject --mcp-config for deskd tools when not already present (#153).
+    if !state
+        .config
+        .command
+        .iter()
+        .any(|a| a.contains("mcp-config"))
+    {
+        let deskd_bin = std::env::var("DESKD_BIN").unwrap_or_else(|_| "deskd".to_string());
+        let mcp_json = serde_json::json!({
+            "mcpServers": {
+                "deskd": {
+                    "command": deskd_bin,
+                    "args": ["mcp", "--agent", name]
+                }
+            }
+        })
+        .to_string();
+        args.push("--mcp-config".to_string());
+        args.push(mcp_json);
+    }
+
     // Inject --model from agent config (sourced from deskd.yaml) unless the command
     // array already contains --model (e.g. hardcoded in workspace.yaml).
     if !state.config.model.is_empty()
@@ -966,6 +987,28 @@ impl AgentProcess {
 
         // Auto-inject required flags for stream-json operation (#151).
         inject_required_flags(&mut args, &state.config.command);
+
+        // Auto-inject --mcp-config for deskd tools when not already present (#153).
+        // This lets sub-agents use send_message, read_inbox, etc. via MCP.
+        if !state
+            .config
+            .command
+            .iter()
+            .any(|a| a.contains("mcp-config"))
+        {
+            let deskd_bin = std::env::var("DESKD_BIN").unwrap_or_else(|_| "deskd".to_string());
+            let mcp_json = serde_json::json!({
+                "mcpServers": {
+                    "deskd": {
+                        "command": deskd_bin,
+                        "args": ["mcp", "--agent", name]
+                    }
+                }
+            })
+            .to_string();
+            args.push("--mcp-config".to_string());
+            args.push(mcp_json);
+        }
 
         if !state.config.model.is_empty()
             && !state
