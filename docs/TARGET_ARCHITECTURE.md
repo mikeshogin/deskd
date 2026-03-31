@@ -1,5 +1,15 @@
 # deskd — Target Architecture
 
+## Vision
+
+deskd — runtime для управления контекстами AI-агентов. Центральная сущность — **Context**, не Agent. Agent (Claude, ACP, Gemini) — это просто executor, инфраструктура. Ценность в курируемом контексте, который делает каждого агента эффективным.
+
+**Context** — граф из нод, определяющий что агент знает и может: какие документы прочитать, какую память загрузить, какие тулы вызвать, какой статус проверить. Всё это материализуется ДО первого сообщения пользователя.
+
+"Переключиться на PM-агента" = загрузить PM-контекст в executor.
+
+---
+
 ## Current State
 
 16,600 строк Rust. Монолитная структура: 20 модулей в плоском `src/`, 1 trait на всю кодобазу (`Adapter`), 35% кода без тестов. Всё зависит от всего через конкретные типы.
@@ -9,7 +19,7 @@ src/
   main.rs          2,011 loc  ← god module, 0 tests
   agent.rs         1,506 loc  ← domain + infra mixed, 0 tests
   mcp.rs           1,297 loc  ← monolithic handler, 0 tests
-  graph.rs         1,384 loc  ← OK, 16 tests
+  graph.rs         1,384 loc  ← skill graph engine, 16 tests
   schedule.rs      1,252 loc  ← mixed concerns
   adapters/
     telegram.rs    1,248 loc
@@ -18,12 +28,12 @@ src/
   worker.rs          991 loc  ← 400-line god function, 0 tests
   acp.rs             951 loc  ← duplicates agent patterns, 17 tests
   config.rs          866 loc  ← god config, fan-in 12
-  workflow.rs        680 loc  ← OK
+  workflow.rs        680 loc
   tasklog.rs         604 loc
   task.rs            521 loc  ← clean, 11 tests
   bus.rs             491 loc  ← clean, 14 tests
   unified_inbox.rs   475 loc  ← clean, 9 tests
-  context.rs         460 loc  ← clean, 12 tests
+  context.rs         460 loc  ← context graph, 12 tests
   statemachine.rs    448 loc  ← clean, 10 tests
   message.rs         126 loc  ← clean, 7 tests
   inbox.rs           123 loc  ← legacy, duplicates unified_inbox
@@ -31,114 +41,145 @@ src/
 
 ---
 
-## Target Architecture
+## Domain Model
 
-### Domain Model
-
-Три bounded contexts:
+### Core Entities
 
 ```
-┌─────────────────────────────────────────────────┐
-│                   deskd                          │
-│                                                  │
-│  ┌──────────┐  ┌──────────┐  ┌───────────────┐  │
-│  │ Messaging│  │  Agents  │  │  Orchestration│  │
-│  │          │  │          │  │               │  │
-│  │ Message  │  │ Agent    │  │ Task          │  │
-│  │ Envelope │  │ State    │  │ StateMachine  │  │
-│  │ Inbox    │  │ Config   │  │ Workflow      │  │
-│  │ Bus      │  │ Runner   │  │ Graph         │  │
-│  │          │  │          │  │ Schedule      │  │
-│  └──────────┘  └──────────┘  └───────────────┘  │
-│                                                  │
-│  ┌──────────────────────────────────────────┐    │
-│  │              Adapters (ports)            │    │
-│  │  Telegram │ Discord │ MCP │ ACP │ CLI   │    │
-│  └──────────────────────────────────────────┘    │
-│                                                  │
-│  ┌──────────────────────────────────────────┐    │
-│  │           Infrastructure                 │    │
-│  │  UnixBus │ FileStore │ Process │ Paths  │    │
-│  └──────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────┘
+Context
+  │
+  ├── ContextGraph          ← граф из нод, определяющий что агент знает
+  │     ├── ReadDocs        ← прочитать файлы/документы
+  │     ├── LoadMemory      ← загрузить релевантную память
+  │     ├── CallTool        ← вызвать тул (git status, check CI, etc.)
+  │     ├── Prompt          ← system prompt + instructions
+  │     └── Branch          ← условное ветвление
+  │
+  ├── Session               ← материализованный контекст (результат выполнения графа)
+  │     ├── documents[]     ← прочитанные документы
+  │     ├── memory[]        ← загруженная память
+  │     ├── tool_results[]  ← результаты тулов
+  │     └── system_prompt   ← финальный system prompt
+  │
+  └── ExecutionGraph        ← граф повторяемых операций (текущий graph.rs)
+        ├── Step            ← нода (tool call, LLM decision, bash)
+        ├── Condition       ← ветвление по результату
+        └── Compression     ← сжатие контекста между шагами
+
+Message                     ← роутинг: Envelope, target, payload
+Task                        ← pull-based очередь асинхронных задач
+StateMachine                ← lifecycle management (states, transitions)
 ```
 
-### Module Layout
+### Bounded Contexts
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                        deskd                             │
+│                                                          │
+│  ┌────────────────┐  ┌──────────┐  ┌─────────────────┐  │
+│  │    Context      │  │ Messaging│  │  Orchestration  │  │
+│  │    (core)       │  │          │  │                 │  │
+│  │                 │  │ Message  │  │ Task            │  │
+│  │ ContextGraph    │  │ Envelope │  │ StateMachine    │  │
+│  │ Session         │  │ Inbox    │  │ Workflow        │  │
+│  │ ExecutionGraph  │  │          │  │ Schedule        │  │
+│  │                 │  │          │  │                 │  │
+│  └────────────────┘  └──────────┘  └─────────────────┘  │
+│                                                          │
+│  ┌──────────────────────────────────────────────────┐    │
+│  │              Adapters (ports)                     │    │
+│  │  Telegram │ Discord │ MCP │ CLI                  │    │
+│  └──────────────────────────────────────────────────┘    │
+│                                                          │
+│  ┌──────────────────────────────────────────────────┐    │
+│  │              Infrastructure                       │    │
+│  │  Executors (Claude/ACP) │ UnixBus │ FileStore    │    │
+│  └──────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Context — core bounded context.** Вокруг него строится всё остальное. Messaging и Orchestration — supporting contexts.
+
+---
+
+## Target Module Layout
 
 ```
 src/
   lib.rs
 
-  # ── Domain (pure types, traits, no I/O) ──────────
+  # ── Domain (pure types + traits, no I/O) ─────────
   domain/
     mod.rs
+    context.rs        # ContextGraph, ContextNode, Session — CORE
+    graph.rs          # ExecutionGraph, Step, StepType, Condition
     message.rs        # Message, Envelope, Register, Metadata
-    agent.rs          # AgentConfig, AgentState, TurnResult, TokenUsage, TaskLimits
-    task.rs           # Task, TaskStatus, TaskCriteria, QueueSummary
+    task.rs           # Task, TaskStatus, TaskCriteria
     statemachine.rs   # Instance, Transition
     inbox.rs          # InboxMessage
-    config.rs         # UserConfig, AgentDef, SubAgentDef, ModelDef, etc.
-    context.rs        # ContextConfig, Node, MainBranch
+    config.rs         # UserConfig, AgentDef, ModelDef (pure data)
 
   # ── Ports (trait definitions) ─────────────────────
   ports/
     mod.rs
-    runner.rs         # trait AgentRunner { send, send_streaming, is_alive, restart }
-    bus.rs            # trait MessageBus { send, subscribe, register }
-    stores.rs         # trait TaskStore, StateMachineStore, InboxStore, TaskLogStore
+    executor.rs       # trait Executor { execute(session) → result }
+    bus.rs            # trait MessageBus { send, recv, register }
+    stores.rs         # trait ContextStore, TaskStore, SMStore, InboxStore
 
   # ── Infrastructure (trait impls, I/O) ─────────────
   infra/
     mod.rs
-    unix_bus.rs       # impl MessageBus for UnixBus
-    file_stores.rs    # impl TaskStore for FileTaskStore, etc.
-    claude_runner.rs  # impl AgentRunner — Claude CLI subprocess
-    acp_runner.rs     # impl AgentRunner — ACP JSON-RPC
-    paths.rs          # state_dir(), log_dir(), reminders_dir()
-    process.rs        # subprocess spawning, stream-json parsing
+    claude.rs         # impl Executor — Claude CLI subprocess
+    acp.rs            # impl Executor — ACP JSON-RPC
+    unix_bus.rs       # impl MessageBus — Unix socket
+    file_stores.rs    # impl *Store — JSON/YAML file persistence
+    paths.rs          # state_dir(), log_dir(), etc.
 
   # ── Adapters (external platform bridges) ──────────
   adapters/
-    mod.rs            # trait Adapter (already exists)
+    mod.rs            # trait Adapter { name, run }
     telegram.rs
     discord.rs
 
   # ── Application (orchestration, use cases) ────────
   app/
     mod.rs
-    worker.rs         # thin orchestrator: MessageHandler + BudgetChecker + QueuePoller + ...
-    serve.rs          # serve() — wires bus + agents + adapters + schedule + workflow
-    schedule.rs       # cron scheduling (without GitHub polling infra)
-    workflow.rs       # workflow engine
-    graph.rs          # skill graph execution
+    worker.rs         # thin loop: recv message → load context → execute → reply
+    serve.rs          # wires bus + agents + adapters + schedule
+    schedule.rs       # cron scheduling
+    workflow.rs       # SM-driven workflow engine
     mcp.rs            # MCP server (tool listing + dispatch)
 
   # ── CLI ───────────────────────────────────────────
   cli/
     mod.rs            # clap structs
-    commands.rs       # task, schedule, status, agent command handlers
+    commands.rs       # subcommand handlers
 
-  main.rs             # thin entry: parse CLI → dispatch
+  main.rs             # thin entry: parse CLI → wire infra → dispatch
 ```
 
-### Key Traits (Ports)
+---
+
+## Key Traits (Ports)
+
+### Executor (бывший AgentRunner)
 
 ```rust
-// ── ports/runner.rs ──
-
-/// Abstraction over agent execution (Claude CLI, ACP, future runtimes).
-pub trait AgentRunner: Send {
-    async fn send(
+/// Abstraction over LLM execution backends.
+/// Claude CLI, ACP, Gemini, Ollama — all implement this.
+/// The executor is stateless infrastructure — it receives a Session
+/// and returns a result. It does not own context or state.
+pub trait Executor: Send {
+    async fn execute(
         &mut self,
-        task: &str,
-        state: &mut AgentState,
+        session: &Session,
         limits: &TaskLimits,
     ) -> Result<TurnResult>;
 
-    async fn send_streaming(
+    async fn execute_streaming(
         &mut self,
-        task: &str,
-        state: &mut AgentState,
+        session: &Session,
         limits: &TaskLimits,
         on_chunk: Box<dyn Fn(&str) + Send>,
     ) -> Result<TurnResult>;
@@ -148,9 +189,9 @@ pub trait AgentRunner: Send {
 }
 ```
 
-```rust
-// ── ports/bus.rs ──
+### MessageBus
 
+```rust
 /// Abstraction over message transport.
 pub trait MessageBus: Send + Sync {
     async fn send(&self, msg: &Message) -> Result<()>;
@@ -159,8 +200,15 @@ pub trait MessageBus: Send + Sync {
 }
 ```
 
+### Stores
+
 ```rust
-// ── ports/stores.rs ──
+/// Context persistence.
+pub trait ContextStore: Send + Sync {
+    fn save(&self, name: &str, graph: &ContextGraph) -> Result<()>;
+    fn load(&self, name: &str) -> Result<ContextGraph>;
+    fn list(&self) -> Result<Vec<String>>;
+}
 
 /// Task queue persistence.
 pub trait TaskRepository: Send + Sync {
@@ -189,11 +237,13 @@ pub trait InboxRepository: Send + Sync {
 }
 ```
 
-### Dependency Rules
+---
+
+## Dependency Rules
 
 ```
                     ┌──────────┐
-                    │  domain   │  ← depends on NOTHING
+                    │  domain   │  ← depends on NOTHING (std + serde only)
                     └────┬─────┘
                          │
                     ┌────▼─────┐
@@ -213,7 +263,7 @@ pub trait InboxRepository: Send + Sync {
                     └────┬─────┘
                          │
                     ┌────▼─────┐
-                    │  main.rs │  ← wires everything together
+                    │  main.rs │  ← wires everything (DI)
                     └──────────┘
 ```
 
@@ -226,14 +276,50 @@ pub trait InboxRepository: Send + Sync {
 - `cli` импортирует `domain` + `app`
 - `main.rs` — единственное место где infra подключается к app (dependency injection)
 
-### Worker: Before → After
+---
 
-**Before (god function):**
+## Context Flow: How It Works
+
+### Переключение контекста
+
+```
+User: "Переключись на PM-агента"
+
+1. Load ContextGraph("pm") from ContextStore
+2. Materialize:
+   ├── ReadDocs("roadmap.md", "backlog.md")
+   ├── CallTool("gh issue list -R kgatilin/deskd --state open")
+   ├── LoadMemory("pm-decisions")
+   └── Prompt("You are a product manager for deskd...")
+3. Build Session { documents, tool_results, memory, system_prompt }
+4. Hand Session to Executor (Claude/ACP)
+5. User talks to "PM agent" with full context already loaded
+```
+
+### Mapping to existing code
+
+| Current | Becomes | Notes |
+|---------|---------|-------|
+| `context.rs` ContextConfig, Node, MainBranch | `domain/context.rs` ContextGraph, ContextNode | Already has graph structure + materialize() |
+| `graph.rs` GraphDef, StepDef | `domain/graph.rs` ExecutionGraph | Already has DAG execution with conditions |
+| `agent.rs` AgentProcess | `infra/claude.rs` ClaudeExecutor | Process management = infrastructure |
+| `acp.rs` AcpProcess | `infra/acp.rs` AcpExecutor | JSON-RPC = infrastructure |
+| `worker.rs` run() | `app/worker.rs` Worker struct | Thin orchestrator with injected deps |
+| `bus.rs` serve() | `infra/unix_bus.rs` UnixBus | Transport = infrastructure |
+| `task.rs` TaskStore | `infra/file_stores.rs` FileTaskStore | Persistence = infrastructure |
+| `config.rs` UserConfig | `domain/config.rs` (pure data) + `infra/paths.rs` | Split pure types from I/O helpers |
+| `inbox.rs` + `unified_inbox.rs` | `infra/file_stores.rs` FileInboxStore | Consolidate into one impl |
+
+---
+
+## Worker: Before → After
+
+**Before (god function, 400 lines):**
 ```rust
 pub async fn run(name: &str, bus_socket: &str, ...) {
-    // 400 lines: bus connect, register, parse messages,
-    // check budget, send typing indicators, stream progress,
-    // poll task queue, handle crashes, write inbox, write tasklog,
+    // bus connect, register, parse messages, check budget,
+    // Telegram typing, stream progress, poll task queue,
+    // crash recovery, write inbox, write tasklog,
     // update SM, reply to bus...
 }
 ```
@@ -241,11 +327,11 @@ pub async fn run(name: &str, bus_socket: &str, ...) {
 **After (thin orchestrator):**
 ```rust
 pub struct Worker {
-    runner: Box<dyn AgentRunner>,
+    executor: Box<dyn Executor>,
     bus: Arc<dyn MessageBus>,
+    contexts: Arc<dyn ContextStore>,
     tasks: Arc<dyn TaskRepository>,
     inbox: Arc<dyn InboxRepository>,
-    tasklog: Arc<dyn TaskLogRepository>,
 }
 
 impl Worker {
@@ -259,14 +345,17 @@ impl Worker {
     }
 
     async fn handle_message(&mut self, msg: Message) {
-        let budget = BudgetChecker::check(&self.state);
-        if budget.exceeded { return self.reject(msg).await; }
-
-        let result = self.runner.send_streaming(
-            &msg.task(), &mut self.state, &self.limits,
-            self.progress_reporter(msg.reply_to()),
+        // 1. Load context for this agent
+        let graph = self.contexts.load(&self.name)?;
+        // 2. Materialize into session
+        let session = graph.materialize().await?;
+        // 3. Add the incoming task to session
+        let session = session.with_task(&msg.task());
+        // 4. Execute
+        let result = self.executor.execute_streaming(
+            &session, &self.limits, self.progress_reporter(),
         ).await;
-
+        // 5. Handle result
         match result {
             Ok(turn) => self.complete(msg, turn).await,
             Err(e) => self.fail(msg, e).await,
@@ -275,68 +364,149 @@ impl Worker {
 }
 ```
 
-### Config: Before → After
+---
 
-**Before:** 16 struct'ов, 866 строк, fan-in 12, path helpers + MCP description generation.
+## archlint Integration
 
-**After:**
-- `domain/config.rs` — UserConfig, AgentDef, SubAgentDef, ModelDef (pure data)
-- `infra/paths.rs` — state_dir(), log_dir(), reminders_dir()
-- `app/mcp.rs` — send_message_description()
-- TaskCriteria stays in domain/task.rs, TransitionDef references it via domain, not cross-module
+### archlint-rs must validate
 
-### archlint Validation Gates
+| Rule | What it checks | Current → Target |
+|------|---------------|-----------------|
+| `fan_out` | Module coupling | main: 18→≤7, worker: 7→≤5 |
+| `fan_in` | Instability | config: 12→≤8 |
+| `dip` | Traits exist for public modules | 9 violations → 0 |
+| `layers` | Dependency direction | ❌ not supported → must add |
+| `forbidden_deps` | domain→infra prohibited | ❌ not supported → must add |
+| `perf` CC | Function complexity | main: CC=72→≤15 |
 
-Каждый этап рефакторинга валидируется archlint-rs:
+### What archlint-rs needs (issues for Misha)
 
-| Metric | Current | Target | Gate |
-|--------|---------|--------|------|
-| Health score | 35/100 | ≥75/100 | CI блокирует merge при снижении |
-| Fan-out max | 18 (main) | ≤7 | `rules.fan_out.threshold: 7` |
-| Fan-in max | 12 (config) | ≤10 | `rules.fan_in.threshold: 10` |
-| DIP violations | 9 | 0 | Каждый модуль с public API должен иметь trait |
-| Cyclomatic complexity | 72 (main) | ≤15 | `perf` check в CI |
-| Untested modules | 4 (35% LOC) | 0 | coverage gate |
+| Issue | What | Why |
+|-------|------|-----|
+| mshogin/archlint#92 | Config schema compatibility | deskd config silently ignored |
+| mshogin/archlint#93 | Layer violation detection | Can't enforce domain→infra rule |
+| mshogin/archlint#94 | Perf false positives | 875 issues, mostly noise |
+| **NEW** | Forbidden dependency check | Can't enforce "message must not import worker" |
+| **NEW** | Module group awareness | Detect domain/, ports/, infra/ as layers automatically |
 
-### Roadmap
+### Target .archlint.yaml
 
-```
-Phase 1: Foundations (traits)            ← Issues #138, #139, #140
-  - AgentRunner trait
-  - MessageBus trait
-  - Store traits
-  archlint gate: DIP violations → 0
+```yaml
+rules:
+  fan_out:
+    threshold: 5
+    exclude: [main]    # CLI entry point
 
-Phase 2: Decomposition                  ← Issues #141, #142, #143, #144
-  - Break up worker::run()
-  - Consolidate inboxes
-  - Break up main.rs
-  - Fix config module
-  archlint gate: fan-out ≤7, fan-in ≤10
+  fan_in:
+    threshold: 8
 
-Phase 3: Testing                        ← Issue #145
-  - Tests for agent, worker, mcp
-  - Integration tests with InMemoryBus + InMemoryStore
-  archlint gate: 0 untested modules
+  dip:
+    check: [domain, ports, app]  # these must have traits
 
-Phase 4: CI enforcement
-  - archlint-rs quality gate in CI
-  - Block merge on health score regression
-  - Block merge on new DIP/fan-out violations
+  layers:
+    - domain           # layer 0: no internal deps
+    - ports            # layer 1: depends on domain only
+    - infra            # layer 2: depends on domain + ports
+    - app              # layer 2: depends on domain + ports
+    - adapters         # layer 2: depends on domain + ports
+    - cli              # layer 3: depends on app
+    - main             # layer 4: wires everything
+
+  forbidden_deps:
+    - from: domain
+      to: [infra, app, adapters, cli]
+      reason: "domain must not depend on outer layers"
+    - from: ports
+      to: [infra, app, adapters, cli]
+      reason: "ports must not depend on implementations"
+    - from: app
+      to: [infra]
+      reason: "app works through traits, not concrete infra"
+
+  perf:
+    max_complexity: 15
+    max_nesting: 5
 ```
 
 ---
 
-## Принципы
+## Roadmap
 
-1. **Каждый модуль — API.** Public types и functions = контракт. Стабильный, лаконичный, расширяемый без breaking changes.
+### Phase 1: Domain Extraction (no new features)
 
-2. **Domain не знает про infrastructure.** AgentState не знает что хранится в YAML файле. Task не знает что лежит в `~/.deskd/tasks/`. Это знает только infra.
+Вытащить чистую доменную модель из существующего кода:
 
-3. **Зависимости текут внутрь.** Adapters → Ports → Domain. Никогда наоборот. main.rs — единственное место где внешнее подключается к внутреннему.
+| What | From | To | Issue |
+|------|------|----|-------|
+| Message, Envelope, Metadata | `message.rs` | `domain/message.rs` | #138 |
+| ContextGraph, Node, Session | `context.rs` | `domain/context.rs` | #138 |
+| ExecutionGraph, Step | `graph.rs` (types only) | `domain/graph.rs` | #138 |
+| Task, TaskStatus, TaskCriteria | `task.rs` (types only) | `domain/task.rs` | #140 |
+| Instance, Transition | `statemachine.rs` (types only) | `domain/statemachine.rs` | #140 |
+| InboxMessage | `unified_inbox.rs` (type only) | `domain/inbox.rs` | #142 |
+| UserConfig, AgentDef, ModelDef | `config.rs` (types only) | `domain/config.rs` | #144 |
 
-4. **Traits на границах.** Везде где модуль A использует модуль B — через trait. Конкретные типы видит только main.rs при wiring.
+Define ports:
+| Trait | Purpose | Issue |
+|-------|---------|-------|
+| Executor | execute(session) → result | #138 |
+| MessageBus | send, recv, register | #139 |
+| ContextStore | save, load, list contexts | NEW |
+| TaskRepository | task CRUD + claim | #140 |
+| StateMachineRepository | SM persistence | #140 |
+| InboxRepository | unified inbox | #142 |
 
-5. **Open/Closed.** Новый adapter (Slack) = новый файл в adapters/. Новый runner (Ollama) = новый файл в infra/. Существующий код не меняется.
+**archlint gate:** DIP violations → 0, no domain→infra imports.
 
-6. **Тесты без I/O.** InMemoryBus, InMemoryStore, MockRunner. Unit tests не трогают файловую систему и сокеты.
+### Phase 2: Decomposition (refactor existing code)
+
+| What | Issue |
+|------|-------|
+| Break up worker::run() → Worker struct with injected deps | #141 |
+| Consolidate inbox.rs + unified_inbox.rs → one InboxRepository | #142 |
+| Break up main.rs → cli/ + serve.rs | #143 |
+| Fix config: extract paths, remove circular deps | #144 |
+| Extract ClaudeExecutor from agent.rs | #138 |
+| Extract AcpExecutor from acp.rs | #138 |
+| Extract UnixBus from bus.rs | #139 |
+| Extract FileStores from task.rs, statemachine.rs, inbox | #140 |
+
+**archlint gate:** fan-out ≤7, fan-in ≤8, CC ≤15.
+
+### Phase 3: Testing
+
+| What | Issue |
+|------|-------|
+| Tests for Executor impls (command building, state transitions) | #145 |
+| Tests for Worker (with InMemoryBus + MockExecutor) | #145 |
+| Tests for MCP (request/response parsing, tool dispatch) | #145 |
+| Integration tests: full pipeline with in-memory infra | #145 |
+
+**archlint gate:** 0 untested modules.
+
+### Phase 4: CI Enforcement
+
+| What |
+|------|
+| archlint-rs quality gate in CI (block merge on regression) |
+| Health score ≥75/100 |
+| Auto-generate architecture.yaml on each merge |
+| Diff report on PRs (new violations highlighted) |
+
+---
+
+## Principles
+
+1. **Context is the core.** Everything serves context management. Executor is infrastructure. Bus is infrastructure. Only Context is domain.
+
+2. **Каждый модуль — API.** Public types и functions = контракт. Стабильный, лаконичный, расширяемый (Open/Closed). Можно расширять, нельзя ломать.
+
+3. **Domain не знает про infrastructure.** ContextGraph не знает что хранится в JSON файле. Task не знает что лежит в `~/.deskd/tasks/`. Message не знает про Unix sockets.
+
+4. **Зависимости текут внутрь.** Infrastructure → Ports → Domain. Никогда наоборот. main.rs — единственное место где внешнее подключается к внутреннему (DI).
+
+5. **Traits на границах.** Везде где модуль A использует модуль B — через trait. Конкретные типы видит только main.rs.
+
+6. **Тесты без I/O.** InMemoryBus, InMemoryStore, MockExecutor. Unit tests не трогают файловую систему и сокеты.
+
+7. **archlint validates architecture.** Если archlint не может проверить правило — это issue на archlint, не повод отказаться от правила.
