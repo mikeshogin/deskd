@@ -276,14 +276,10 @@ fn rotate(path: &Path, keep: usize) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
-
     /// Create a unique temporary base directory for each test.
     fn test_base() -> PathBuf {
-        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("deskd_unified_inbox_test_{}", id));
+        let dir =
+            std::env::temp_dir().join(format!("deskd_unified_inbox_test_{}", uuid::Uuid::new_v4()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

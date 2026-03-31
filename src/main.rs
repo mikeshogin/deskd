@@ -4,10 +4,13 @@ mod agent;
 mod bus;
 mod config;
 pub mod context;
+mod domain;
 pub mod graph;
 mod inbox;
 mod mcp;
 mod message;
+#[allow(dead_code)]
+mod ports;
 mod schedule;
 mod statemachine;
 mod task;
